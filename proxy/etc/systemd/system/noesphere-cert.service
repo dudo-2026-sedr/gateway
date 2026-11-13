@@ -1,0 +1,5 @@
+[Unit]
+Description=Issue the Noesphere TLS certificate
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/noesphere-issue-cert.sh
