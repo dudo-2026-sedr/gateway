@@ -1,5 +1,0 @@
-[Unit]
-Description=Noesphere DB and config backup
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/noesphere-backup.sh

@@ -1,8 +1,0 @@
-[Unit]
-Description=Retry Noesphere TLS issuance until it succeeds
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=20min
-Persistent=true
-[Install]
-WantedBy=timers.target
