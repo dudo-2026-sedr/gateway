@@ -33,6 +33,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -66,6 +67,9 @@ DB_FILE = os.getenv("DB_FILE", "/data/noesphere.db" if os.path.exists("/data") e
 PORT = int(os.getenv("PORT", "8000"))
 WORKERS = int(os.getenv("WORKERS", "1"))
 KEEPALIVE_INTERVAL = float(os.getenv("KEEPALIVE_INTERVAL", "15.0"))
+# Во сколько раз расход токенов ключа считается больше настоящего. 2.5 -> клиент,
+# потративший у апстрима 70k, видит у себя 175k.
+TOKEN_MULTIPLIER = float(os.getenv("TOKEN_MULTIPLIER", "2.5"))
 
 SERVER_HEADER = "noesphere"
 SPHERE_VERSION = "1.0"
@@ -182,6 +186,8 @@ def init_db() -> None:
             delay_sec       REAL DEFAULT 0.0,
             is_reasoning    INTEGER DEFAULT 0,
             endpoint_mode   INTEGER DEFAULT 3,
+            system_prompt   TEXT DEFAULT '',
+            system_repeat_tokens INTEGER DEFAULT 128000,
             enabled         INTEGER DEFAULT 1
         );
 
@@ -193,7 +199,8 @@ def init_db() -> None:
             enabled     INTEGER DEFAULT 1,
             created_at  TEXT DEFAULT '',
             upstream_key TEXT DEFAULT '',
-            key_format  TEXT DEFAULT 'noe'
+            key_format  TEXT DEFAULT 'noe',
+            token_limit INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS key_usage (
@@ -201,6 +208,7 @@ def init_db() -> None:
             requests      INTEGER DEFAULT 0,
             input_tokens  INTEGER DEFAULT 0,
             output_tokens INTEGER DEFAULT 0,
+            billed_tokens INTEGER DEFAULT 0,
             last_used     TEXT DEFAULT ''
         );
 
@@ -218,6 +226,17 @@ def init_db() -> None:
         _cols = {r[1] for r in c.execute("PRAGMA table_info(api_keys)")}
         if "upstream_key" not in _cols:
             c.execute("ALTER TABLE api_keys ADD COLUMN upstream_key TEXT DEFAULT ''")
+        _mcols = {r[1] for r in c.execute("PRAGMA table_info(mappings)")}
+        if "system_prompt" not in _mcols:
+            c.execute("ALTER TABLE mappings ADD COLUMN system_prompt TEXT DEFAULT ''")
+        if "system_repeat_tokens" not in _mcols:
+            c.execute("ALTER TABLE mappings ADD COLUMN system_repeat_tokens INTEGER DEFAULT 128000")
+        if "token_limit" not in _cols:
+            c.execute("ALTER TABLE api_keys ADD COLUMN token_limit INTEGER DEFAULT 0")
+        _ucols = {r[1] for r in c.execute("PRAGMA table_info(key_usage)")}
+        if "billed_tokens" not in _ucols:
+            c.execute("ALTER TABLE key_usage ADD COLUMN billed_tokens INTEGER DEFAULT 0")
+        c.commit()
     try:
         with sqlite3.connect(DB_FILE) as c:
             c.execute("ALTER TABLE api_keys ADD COLUMN key_format TEXT DEFAULT 'noe'")
@@ -271,6 +290,15 @@ def load_data() -> None:
             ERROR_RULES = [dict(r) for r in c.execute("SELECT * FROM error_rules ORDER BY id")]
         except Exception:
             ERROR_RULES = []
+        # Расход с множителем не должен просесть из-за того, что база отстала
+        # от памяти (буфер сбрасывается раз в 30 с).
+        try:
+            for r in c.execute("SELECT key_id, billed_tokens FROM key_usage"):
+                kid, val = int(r["key_id"]), int(r["billed_tokens"] or 0)
+                if val > KEY_BILLED.get(kid, 0):
+                    KEY_BILLED[kid] = val
+        except Exception:
+            pass
 
 # ══════════════════════════════════════════════════════════════════════
 #  RATE LIMITER
@@ -299,16 +327,43 @@ async def check_rate(key_id: int, limit: int) -> tuple[bool, int, int]:
 
 _usage_buf: dict[int, dict] = {}
 _usage_lock = asyncio.Lock()
+# Счётчик с множителем в памяти — по нему решается, не исчерпан ли лимит ключа.
+# Он же переживает перечитывание базы: load_data только поднимает значение.
+KEY_BILLED: dict[int, int] = {}
+
+
+def billed_tokens(in_tok: int = 0, out_tok: int = 0) -> int:
+    raw = max(0, int(in_tok)) + max(0, int(out_tok))
+    if not raw:
+        return 0
+    mult = TOKEN_MULTIPLIER if TOKEN_MULTIPLIER > 0 else 1.0
+    return int(math.ceil(raw * mult))
+
+
+def token_quota_state(key_rec: dict) -> tuple[bool, int, int]:
+    """(request allowed, billed tokens used, limit). limit <= 0 — без лимита."""
+    try:
+        limit = int(key_rec.get("token_limit") or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    used = KEY_BILLED.get(key_rec.get("id"), 0)
+    if limit <= 0:
+        return True, used, 0
+    return used < limit, used, limit
 
 
 async def bump_usage(key_id: Optional[int], in_tok: int = 0, out_tok: int = 0) -> None:
     if not key_id:
         return
+    billed = billed_tokens(in_tok, out_tok)
     async with _usage_lock:
-        d = _usage_buf.setdefault(key_id, {"r": 0, "i": 0, "o": 0})
+        d = _usage_buf.setdefault(key_id, {"r": 0, "i": 0, "o": 0, "b": 0})
         d["r"] += 1
         d["i"] += max(0, int(in_tok))
         d["o"] += max(0, int(out_tok))
+        d["b"] += billed
+    if billed:
+        KEY_BILLED[key_id] = KEY_BILLED.get(key_id, 0) + billed
 
 
 async def flush_usage() -> None:
@@ -323,14 +378,16 @@ async def flush_usage() -> None:
         with sqlite3.connect(DB_FILE) as c:
             for kid, d in batch.items():
                 c.execute("""
-                    INSERT INTO key_usage (key_id, requests, input_tokens, output_tokens, last_used)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO key_usage (key_id, requests, input_tokens, output_tokens,
+                                           billed_tokens, last_used)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(key_id) DO UPDATE SET
                         requests      = requests + excluded.requests,
                         input_tokens  = input_tokens + excluded.input_tokens,
                         output_tokens = output_tokens + excluded.output_tokens,
+                        billed_tokens = billed_tokens + excluded.billed_tokens,
                         last_used     = excluded.last_used
-                """, (kid, d["r"], d["i"], d["o"], stamp))
+                """, (kid, d["r"], d["i"], d["o"], d.get("b", 0), stamp))
             c.commit()
 
     try:
@@ -2320,6 +2377,69 @@ def system_text_of(msg: dict) -> str:
     return ""
 
 
+# ── системные инструкции модели ───────────────────────────────────────
+# Инструкция из карточки модели уходит апстриму как system-сообщение: оно
+# стоит первым в списке (наивысший приоритет) и повторяется каждые
+# system_repeat_tokens токенов — после сотни тысяч токенов начало контекста
+# перестаёт влиять на ответ, поэтому инструкцию дублируем по ходу переписки.
+
+def model_system_prompt(mapping: dict) -> str:
+    p = (mapping or {}).get("system_prompt")
+    return p.strip() if isinstance(p, str) else ""
+
+
+def _system_repeat_interval(mapping: dict) -> int:
+    try:
+        return int((mapping or {}).get("system_repeat_tokens") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def inject_system_instructions(messages: Any, mapping: dict) -> list:
+    """Возвращает новый список сообщений с системной инструкцией модели.
+
+    Инструкция ставится первой (или вливается в начало уже существующего
+    system-сообщения клиента, оставаясь выше него) и повторяется каждые
+    system_repeat_tokens токенов. interval <= 0 — только в начале.
+    """
+    if not isinstance(messages, list):
+        return messages
+    instruction = model_system_prompt(mapping)
+    if not instruction:
+        return messages
+
+    out: list = []
+    first = messages[0] if messages else None
+    if isinstance(first, dict) and first.get("role") == "system":
+        head = dict(first)
+        c = head.get("content")
+        if isinstance(c, list):
+            head["content"] = [{"type": "text", "text": instruction}] + list(c)
+        elif isinstance(c, str) and c.strip():
+            head["content"] = instruction + "\n\n" + c
+        else:
+            head["content"] = instruction
+        out.append(head)
+        rest = messages[1:]
+    else:
+        out.append({"role": "system", "content": instruction})
+        rest = messages
+
+    every = _system_repeat_interval(mapping)
+    if every <= 0:
+        out.extend(rest)
+        return out
+
+    acc = 0
+    for m in rest:
+        if acc >= every:
+            out.append({"role": "system", "content": instruction})
+            acc = 0
+        out.append(m)
+        acc += estimate_messages_tokens([m])
+    return out
+
+
 class _AnthropicRequestError(Exception):
     def __init__(self, message: str, status_code: int = 400):
         super().__init__(message)
@@ -2478,6 +2598,15 @@ async def openai_chat(req: Request):
             headers={**gw_headers(req_id), "retry-after": str(retry)},
         )
 
+    quota_ok, tok_used, tok_limit = token_quota_state(key_rec)
+    if not quota_ok:
+        return JSONResponse(
+            {"error": {"message": f"Token quota exhausted for this API key: "
+                                   f"{tok_used} of {tok_limit} tokens used.",
+                       "type": "insufficient_quota", "code": "insufficient_quota"}},
+            status_code=429, headers=gw_headers(req_id),
+        )
+
     try:
         body = await req.json()
     except Exception:
@@ -2503,9 +2632,9 @@ async def openai_chat(req: Request):
                        "No upstream key for this client key. Set it when generating the key.",
                        401, req_id, fake_model)
 
-    # Сообщения клиента уходят апстриму как есть: прокси в них ничего не дописывает.
-    # Локальная привязка нужна ниже для подсчёта токенов и оценки лимитов.
-    msgs = body.get("messages", [])
+    # Единственная правка сообщений — системная инструкция модели из её карточки.
+    msgs = inject_system_instructions(body.get("messages", []), mapping)
+    body["messages"] = msgs
     body["tools"] = _add_search_tool(body.get("tools"))
     body["model"] = mapping["real_model"]
     stream = bool(body.get("stream"))
@@ -3300,6 +3429,13 @@ async def anth_messages(req: Request):
             headers={**gw_headers(req_id, provider="anthropic"), "retry-after": str(retry)},
         )
 
+    quota_ok, tok_used, tok_limit = token_quota_state(key_rec)
+    if not quota_ok:
+        return err_ant("permission_error",
+                       f"Token quota exhausted for this API key: {tok_used} of "
+                       f"{tok_limit} tokens used.",
+                       403, req_id)
+
     try:
         body = await req.json()
     except Exception:
@@ -3361,7 +3497,8 @@ async def anth_messages(req: Request):
     if _anth_ver and _anth_ver not in ("2023-06-01", "2023-01-01"):
         log.info("[ANTH] version=%r betas=%s", _anth_ver, _anth_betas)
     oai_req = await anth_to_openai(body)
-    # Сообщения уходят апстриму без правок.
+    # Системная инструкция модели — первой и с повторами по ходу диалога.
+    oai_req["messages"] = inject_system_instructions(oai_req.get("messages") or [], mapping)
     oai_req["tools"] = _add_search_tool(oai_req.get("tools"))
     oai_req["model"] = mapping["real_model"]
     stream = bool(body.get("stream"))
@@ -4069,6 +4206,8 @@ function fillModal(btn){
   q('#m_delay').value=d.delay||'0';
   q('#m_reason').value=d.reason||'0';
   q('#m_endpoint').value=d.endpoint||'3';
+  q('#m_sys').value=d.sys||'';
+  q('#m_sysrep').value=d.sysrep||'128000';
   q('#m_title').textContent=d.id?'Edit Model':'New Model';
   openM('modal_model');
 }
@@ -4076,6 +4215,7 @@ function newModel(){
   q('#m_id').value='';q('#m_fake').value='';q('#m_real').value='';
   q('#m_owner').value='noetic-labs';q('#m_ctx').value='128000';
   q('#m_delay').value='0';q('#m_reason').value='0';q('#m_endpoint').value='3';
+  q('#m_sys').value='';q('#m_sysrep').value='128000';
   q('#m_title').textContent='New Model';
   openM('modal_model');
 }
@@ -4279,6 +4419,7 @@ async def admin_chat(request: Request, key: str = Depends(verify_admin)):
         text = last.get("content") or ""
         last["content"] = ([{"type": "text", "text": text}] if text else []) + file_parts
 
+    msgs = inject_system_instructions(msgs, mapping)
     payload: dict[str, Any] = {
         "model": mapping["real_model"],
         "messages": msgs,
@@ -5945,6 +6086,10 @@ def render_dashboard(key: str) -> str:
         for m in maps:
             ep = {1: "anthropic", 2: "openai", 3: "both"}.get(m["endpoint_mode"], "both")
             reas = f'{m["is_reasoning"]}x' if m["is_reasoning"] else "off"
+            sys_text = (m.get("system_prompt") or "").strip()
+            sys_rep = m.get("system_repeat_tokens") or 0
+            sys_pill = (f'<span class="pill pink" title="Системная инструкция '
+                        f'из карточки модели">sys</span>' if sys_text else '')
             map_rows += (
                 f'<tr>'
                 f'<td><code class="k em">{_esc(m["fake_model"])}</code></td>'
@@ -5952,7 +6097,7 @@ def render_dashboard(key: str) -> str:
                 f'<td><span class="pill tag">up#{m["upstream_id"]}</span></td>'
                 f'<td><span class="pill cyan">{ep}</span></td>'
                 f'<td><span class="pill pink">{reas}</span></td>'
-                f'<td><span class="pill tag">{m["context_length"]//1000}k</span></td>'
+                f'<td><span class="pill tag">{m["context_length"]//1000}k</span>{sys_pill}</td>'
                 f'<td>{m["delay_sec"]}s</td>'
                 f'<td><span class="pill {"on" if m["enabled"] else "off"}">'
                 f'{"on" if m["enabled"] else "off"}</span></td>'
@@ -5963,6 +6108,7 @@ def render_dashboard(key: str) -> str:
                 f'data-owner="{_esc(m["owned_by"])}" data-ctx="{m["context_length"]}" '
                 f'data-delay="{m["delay_sec"]}" data-reason="{m["is_reasoning"]}" '
                 f'data-endpoint="{m["endpoint_mode"]}" '
+                f'data-sys="{_esc(sys_text)}" data-sysrep="{sys_rep}" '
                 f'onclick="fillModal(this)">{_svg("edit")}</button>'
                 f'<form method="post" action="/admin/mappings/toggle?key={key}" style="margin:0">'
                 f'<input type="hidden" name="id" value="{m["id"]}">'
@@ -5982,6 +6128,33 @@ def render_dashboard(key: str) -> str:
             req = u.get("requests", 0)
             ink = u.get("input_tokens", 0)
             outk = u.get("output_tokens", 0)
+            billed = u.get("billed_tokens", 0)
+            k_limit = k.get("token_limit") or 0
+            if k_limit:
+                over = billed >= k_limit
+                quota_html = (
+                    f'<form method="post" action="/admin/keys/limit?key={key}" '
+                    f'style="margin:4px 0 0;display:flex;gap:4px;align-items:center">'
+                    f'<input type="hidden" name="id" value="{k["id"]}">'
+                    f'<span class="pill {"off" if over else "on"}" '
+                    f'title="Расход с множителем ×{TOKEN_MULTIPLIER:g}">'
+                    f'{billed//1000}k / {k_limit//1000}k</span>'
+                    f'<input name="token_limit" type="number" value="{k_limit}" '
+                    f'style="width:86px;padding:2px 6px;font-size:11px">'
+                    f'<button class="btn ghost" style="padding:2px 6px;font-size:11px">ok</button>'
+                    f'</form>'
+                )
+            else:
+                quota_html = (
+                    f'<form method="post" action="/admin/keys/limit?key={key}" '
+                    f'style="margin:4px 0 0;display:flex;gap:4px;align-items:center">'
+                    f'<input type="hidden" name="id" value="{k["id"]}">'
+                    f'<span style="font-size:11px;color:var(--tx3)">no token limit</span>'
+                    f'<input name="token_limit" type="number" value="0" min="0" '
+                    f'style="width:86px;padding:2px 6px;font-size:11px">'
+                    f'<button class="btn ghost" style="padding:2px 6px;font-size:11px">set</button>'
+                    f'</form>'
+                )
             key_rows += (
                 f'<tr>'
                 f'<td><span class="pill tag">#{k["id"]}</span></td>'
@@ -6001,7 +6174,7 @@ def render_dashboard(key: str) -> str:
                 f'{_esc(mask_key(k.get("upstream_key") or "")) or "—"}</code></td>'
                 f'<td><span class="pill tag">{k["rpm_limit"]} rpm</span></td>'
                 f'<td><div style="font-size:12px;color:var(--tx2);font-variant-numeric:tabular-nums">'
-                f'{req} req · {ink//1000}k in · {outk//1000}k out</div></td>'
+                f'{req} req · {ink//1000}k in · {outk//1000}k out</div>{quota_html}</td>'
                 f'<td><span class="pill {"on" if k["enabled"] else "off"}">'
                 f'{"on" if k["enabled"] else "off"}</span></td>'
                 f'<td><div class="acts">'
@@ -6099,6 +6272,8 @@ def render_dashboard(key: str) -> str:
       <form class="form" method="post" action="/admin/keys/add?key={key}">
         <input name="note" placeholder="Name (client name)" required>
         <input name="rpm_limit" type="number" value="60" min="1" placeholder="RPM limit">
+        <input name="token_limit" type="number" value="0" min="0"
+               placeholder="Token limit (0 = unlimited, счёт ×2.5)">
         <select name="key_format" title="Формат выдаваемого ключа">
           <option value="noe">sk-noe-v1 — наш формат</option>
           <option value="anthropic">sk-ant-api03 — Anthropic</option>
@@ -6171,6 +6346,16 @@ def render_dashboard(key: str) -> str:
             <option value="1">Anthropic only — /v1/messages</option>
             <option value="2">OpenAI only — /v1/chat/completions</option>
           </select>
+        </div>
+        <div class="fg full">
+          <label>System instructions (injected as system, highest priority)</label>
+          <textarea name="system_prompt" id="m_sys" rows="6"
+            placeholder="Правила, которые модель держит весь диалог"></textarea>
+        </div>
+        <div class="fg">
+          <label>Repeat every (tokens, 0 = start only)</label>
+          <input name="system_repeat_tokens" id="m_sysrep" type="number" min="0"
+                 step="1000" value="128000">
         </div>
       </div>
       <div class="modal-ft">
@@ -6245,25 +6430,31 @@ async def map_save(row_id: str = Form(""), fake_model: str = Form(...),
                    owned_by: str = Form("noetic-labs"),
                    context_length: int = Form(128000), delay_sec: float = Form(0.0),
                    is_reasoning: int = Form(0), endpoint_mode: int = Form(3),
+                   system_prompt: str = Form(""),
+                   system_repeat_tokens: int = Form(128000),
                    key: str = Depends(verify_admin)):
+    prompt = (system_prompt or "").strip()
+    repeat = max(0, int(system_repeat_tokens))
     def _w() -> None:
         with sqlite3.connect(DB_FILE) as c:
             if row_id and row_id.isdigit():
                 c.execute("""UPDATE mappings SET
                     fake_model=?, real_model=?, upstream_id=?, owned_by=?,
-                    context_length=?, delay_sec=?, is_reasoning=?, endpoint_mode=?
+                    context_length=?, delay_sec=?, is_reasoning=?, endpoint_mode=?,
+                    system_prompt=?, system_repeat_tokens=?
                     WHERE id=?""",
                     (fake_model.strip(), real_model.strip(), upstream_id, owned_by.strip(),
                      int(context_length), float(delay_sec), int(is_reasoning),
-                     int(endpoint_mode), int(row_id)))
+                     int(endpoint_mode), prompt, repeat, int(row_id)))
             else:
                 c.execute("""INSERT OR REPLACE INTO mappings
                     (fake_model, real_model, upstream_id, owned_by, context_length,
-                     delay_sec, is_reasoning, endpoint_mode, enabled)
-                    VALUES (?,?,?,?,?,?,?,?,1)""",
+                     delay_sec, is_reasoning, endpoint_mode, system_prompt,
+                     system_repeat_tokens, enabled)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,1)""",
                     (fake_model.strip(), real_model.strip(), upstream_id, owned_by.strip(),
                      int(context_length), float(delay_sec), int(is_reasoning),
-                     int(endpoint_mode)))
+                     int(endpoint_mode), prompt, repeat))
             c.commit()
     await asyncio.to_thread(_w)
     load_data()
@@ -6295,6 +6486,7 @@ async def map_del(id: int = Form(...), key: str = Depends(verify_admin)):
 @app.post("/admin/keys/add")
 async def k_add(note: str = Form(""), rpm_limit: int = Form(60),
                 upstream_key: str = Form(""), key_format: str = Form("noe"),
+                token_limit: int = Form(0),
                 key: str = Depends(verify_admin)):
     new_k = gen_key(key_format)
     created = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -6303,10 +6495,10 @@ async def k_add(note: str = Form(""), rpm_limit: int = Form(60),
         with sqlite3.connect(DB_FILE) as c:
             c.execute("""INSERT INTO api_keys
                          (public_key, note, rpm_limit, enabled, created_at, upstream_key,
-                          key_format)
-                         VALUES (?,?,?,1,?,?,?)""",
+                          key_format, token_limit)
+                         VALUES (?,?,?,1,?,?,?,?)""",
                       (new_k, note.strip(), int(rpm_limit), created, upstream_key.strip(),
-                       (key_format or "noe").strip().lower()))
+                       (key_format or "noe").strip().lower(), max(0, int(token_limit))))
             c.commit()
     await asyncio.to_thread(_w)
     load_data()
@@ -6320,6 +6512,19 @@ async def k_add(note: str = Form(""), rpm_limit: int = Form(60),
         f"\\n\\nCopy it now.');"
         f"location.href='/admin?key={key}';</script>"
     )
+
+
+@app.post("/admin/keys/limit")
+async def k_limit(id: int = Form(...), token_limit: int = Form(0),
+                 key: str = Depends(verify_admin)):
+    limit = max(0, int(token_limit))
+    def _w() -> None:
+        with sqlite3.connect(DB_FILE) as c:
+            c.execute("UPDATE api_keys SET token_limit=? WHERE id=?", (limit, id))
+            c.commit()
+    await asyncio.to_thread(_w)
+    load_data()
+    return _redir(key)
 
 
 @app.post("/admin/keys/toggle")
