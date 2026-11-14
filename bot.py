@@ -40,6 +40,7 @@ import re
 import secrets
 import sqlite3
 import string
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -54,12 +55,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_TG_ID", "5480751648"))
 
 DB_FILE = os.getenv("DB_FILE", "/data/noesphere.db" if os.path.exists("/data") else "noesphere.db")
-PROXY_BASE = os.getenv("PROXY_BASE_URL", "https://api.funtro.cyou").rstrip("/")
+PROXY_BASE = os.getenv("PROXY_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 PROXY_ADMIN_KEY = os.getenv("PROXY_ADMIN_KEY", "dudo_2026").strip()
 
-START_TOKENS = int(os.getenv("START_TOKENS", "500000"))
+START_TOKENS = int(os.getenv("START_TOKENS", "0"))
 REF_BONUS = int(os.getenv("REF_BONUS", "3000000"))
-REF_CONFIRM_TOKENS = int(os.getenv("REF_CONFIRM_TOKENS", "50000"))
 RANK2_TOKENS = int(os.getenv("RANK2_TOKENS", "400000"))
 RANK2_REFS = int(os.getenv("RANK2_REFS", "3"))
 RANK3_TOKENS = int(os.getenv("RANK3_TOKENS", "2000000"))
@@ -75,7 +75,10 @@ DAILY_TOKENS = {
     3: int(os.getenv("DAILY_TOKENS_3", "15000000")),
 }
 RESET_TZ_OFFSET = float(os.getenv("RESET_TZ_OFFSET", "3"))
-DEFAULT_RPM = int(os.getenv("DEFAULT_RPM", "120"))
+DEFAULT_RPM = int(os.getenv("DEFAULT_RPM", "30"))
+# Сколько токенов выставлять ключу, создаваемому без явной квоты (0 в учёте
+# означает «без лимита»).
+BOT_DEFAULT_LIMIT = int(os.getenv("DEFAULT_KEY_TOKENS", "3000000"))
 KEY_FORMAT = (os.getenv("KEY_FORMAT", "anthropic") or "anthropic").strip().lower()
 PROBE_TTL = float(os.getenv("PROBE_TTL", "60"))
 TICK_SEC = float(os.getenv("TICK_SEC", "60"))
@@ -88,6 +91,14 @@ CHAT_URL = os.getenv("CHAT_URL", "https://t.me/+b2t10tfRDGEyMGY0").strip()
 SUB_CACHE_TTL = float(os.getenv("SUB_CACHE_TTL", "20"))
 SUB_CHECK_EVERY = float(os.getenv("SUB_CHECK_EVERY", "600"))
 REF_CONFIRM_REQUESTS = int(os.getenv("REF_CONFIRM_REQUESTS", "5"))
+
+# Бонусы за упоминание тега: в имени/фамилии +1M к дневному лимиту,
+# в описании профиля («@cer_ai — бесплатный клод») ещё +500k.
+BONUS_TAG = os.getenv("BONUS_TAG", "@cer_ai").strip().lower()
+BONUS_NAME = int(os.getenv("BONUS_NAME", "1000000"))
+BONUS_BIO = int(os.getenv("BONUS_BIO", "500000"))
+PROFILE_TTL = float(os.getenv("PROFILE_TTL", "120"))
+PROFILE_CHECK_EVERY = float(os.getenv("PROFILE_CHECK_EVERY", "1800"))
 
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN env var is required")
@@ -115,13 +126,211 @@ INF = "∞"
 SEP = "───────────────"
 
 # ══════════════════════════════════════════════════════════════════════
+#  БАЗА: SQLite или PostgreSQL
+#  Если задан DATABASE_URL (Railway/Supabase) — работаем с Postgres,
+#  иначе с локальным sqlite-файлом. SQL один: «?» → «%s» и мелкие
+#  sqlite-привычки переводятся на лету.
+# ══════════════════════════════════════════════════════════════════════
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+PG_MODE = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+
+if PG_MODE:
+    try:
+        import psycopg  # type: ignore
+    except ImportError as _e:  # pragma: no cover
+        raise RuntimeError("DATABASE_URL задан, но psycopg не установлен: "
+                           "pip install 'psycopg[binary]'") from _e
+    DB_ERRORS: tuple = (sqlite3.Error, psycopg.Error)
+else:
+    DB_ERRORS = (sqlite3.Error,)
+
+
+class DbRow(dict):
+    """Строка, у которой работает и r["col"], и r[0]."""
+
+    def __init__(self, cols, vals):
+        super().__init__((c, v) for c, v in zip(cols, vals))
+        self._vals = tuple(vals)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._vals[key]
+        return super().__getitem__(key)
+
+
+def _sql_fix(sql: str) -> str:
+    out = sql.replace("?", "%s")
+    out = re.sub(r"\bAUTOINCREMENT\b", "", out, flags=re.I)
+    out = re.sub(r"\bINTEGER\s+PRIMARY\s+KEY\b", "BIGSERIAL PRIMARY KEY", out, flags=re.I)
+    out = re.sub(r"\bMAX\s*\(", "GREATEST(", out, flags=re.I)
+    out = re.sub(r"\bMIN\s*\(", "LEAST(", out, flags=re.I)
+    return out
+
+
+def _split_sql(script: str) -> list[str]:
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: Optional[str] = None
+    for ch in script:
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            continue
+        if ch == ";":
+            parts.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    if "".join(buf).strip():
+        parts.append("".join(buf))
+    return [p.strip() for p in parts
+            if p.strip() and not p.strip().upper().startswith("PRAGMA")]
+
+
+_PG_LOCK = threading.Lock()
+_PG_IDLE: list = []
+PG_POOL_SIZE = int(os.getenv("PG_POOL_SIZE", "4"))
+
+
+class PgCursor:
+    def __init__(self, cur):
+        self._cur = cur
+
+    def _cols(self) -> list[str]:
+        return [d.name for d in (self._cur.description or [])]
+
+    def fetchone(self):
+        row = self._cur.fetchone()
+        return None if row is None else DbRow(self._cols(), row)
+
+    def fetchall(self):
+        cols = self._cols()
+        return [DbRow(cols, r) for r in self._cur.fetchall()]
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+def _pg_new():
+    dsn = DATABASE_URL
+    if "sslmode=" not in dsn:
+        dsn += ("&" if "?" in dsn else "?") + "sslmode=require"
+    return psycopg.connect(dsn, prepare_threshold=None,
+                           connect_timeout=int(os.getenv("PG_CONNECT_TIMEOUT", "15")))
+
+
+def _pg_checkout():
+    with _PG_LOCK:
+        if _PG_IDLE:
+            return _PG_IDLE.pop()
+    return _pg_new()
+
+
+def _pg_checkin(conn) -> None:
+    try:
+        if conn.closed or conn.broken:
+            conn.close()
+            return
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return
+    with _PG_LOCK:
+        if len(_PG_IDLE) < PG_POOL_SIZE:
+            _PG_IDLE.append(conn)
+            return
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+class PgConn:
+    """Адаптер с интерфейсом sqlite3.Connection поверх пула соединений.
+
+    Соединение с Supabase/pooler стоит 2-3 секунды, поэтому одноразовые
+    коннекты убивают отзывчивость: держим пул и переиспользуем.
+    """
+
+    def __init__(self):
+        self._c = _pg_checkout()
+        self.row_factory = None
+        self._done = False
+
+    def execute(self, sql: str, params=()):
+        try:
+            return PgCursor(self._c.execute(_sql_fix(sql), params or None))
+        except (psycopg.OperationalError, psycopg.InterfaceError):
+            self._c = _pg_new()
+            return PgCursor(self._c.execute(_sql_fix(sql), params or None))
+
+    def executescript(self, script: str) -> None:
+        for stmt in _split_sql(script):
+            self._c.execute(_sql_fix(stmt))
+
+    def commit(self) -> None:
+        self._c.commit()
+
+    def rollback(self) -> None:
+        self._c.rollback()
+
+    def close(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        _pg_checkin(self._c)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type:
+                self._c.rollback()
+            else:
+                self._c.commit()
+        except Exception:
+            try:
+                self._c.close()
+            except Exception:
+                pass
+            self._done = True
+            return False
+        self.close()
+        return False
+
+
+def connect_db():
+    if PG_MODE:
+        return PgConn()
+    return sqlite3.connect(DB_FILE, timeout=15)
+
+
+def table_cols(c, table: str) -> set[str]:
+    if PG_MODE:
+        rows = c.execute("SELECT column_name FROM information_schema.columns "
+                         "WHERE table_schema='public' AND table_name=?", (table,)).fetchall()
+        return {r[0] for r in rows}
+    return {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  DATABASE
 # ══════════════════════════════════════════════════════════════════════
 
 
-def db() -> sqlite3.Connection:
-    c = sqlite3.connect(DB_FILE, timeout=15)
-    c.row_factory = sqlite3.Row
+def db():
+    c = connect_db()
+    if not PG_MODE:
+        c.row_factory = sqlite3.Row
     return c
 
 
@@ -168,7 +377,12 @@ def init_db() -> None:
             bonus_tokens    INTEGER DEFAULT 0,
             last_reset      TEXT DEFAULT '',
             subscribed      INTEGER DEFAULT 0,
-            last_sub_check  TEXT DEFAULT ''
+            last_sub_check  TEXT DEFAULT '',
+            rank_manual     INTEGER DEFAULT 0,
+            bonus_name      INTEGER DEFAULT 0,
+            bonus_bio       INTEGER DEFAULT 0,
+            bio             TEXT DEFAULT '',
+            profile_checked TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS tg_events (
             id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -182,7 +396,7 @@ def init_db() -> None:
             value TEXT NOT NULL
         );
         """)
-        _cols = {r[1] for r in c.execute("PRAGMA table_info(api_keys)")}
+        _cols = table_cols(c, "api_keys")
         for name, decl in (("upstream_key", "TEXT DEFAULT ''"),
                            ("key_format", "TEXT DEFAULT 'noe'"),
                            ("token_limit", "INTEGER DEFAULT 0"),
@@ -191,17 +405,22 @@ def init_db() -> None:
                            ("tg_id", "INTEGER DEFAULT 0")):
             if name not in _cols:
                 c.execute(f"ALTER TABLE api_keys ADD COLUMN {name} {decl}")
-        _ucols = {r[1] for r in c.execute("PRAGMA table_info(key_usage)")}
+        _ucols = table_cols(c, "key_usage")
         for name, decl in (("billed_tokens", "INTEGER DEFAULT 0"),
                            ("hidden_tokens", "INTEGER DEFAULT 0")):
             if name not in _ucols:
                 c.execute(f"ALTER TABLE key_usage ADD COLUMN {name} {decl}")
-        _tcols = {r[1] for r in c.execute("PRAGMA table_info(tg_users)")}
+        _tcols = table_cols(c, "tg_users")
         for name, decl in (("lifetime_tokens", "INTEGER DEFAULT 0"),
                            ("bonus_tokens", "INTEGER DEFAULT 0"),
                            ("last_reset", "TEXT DEFAULT ''"),
                            ("subscribed", "INTEGER DEFAULT 0"),
-                           ("last_sub_check", "TEXT DEFAULT ''")):
+                           ("last_sub_check", "TEXT DEFAULT ''"),
+                           ("rank_manual", "INTEGER DEFAULT 0"),
+                           ("bonus_name", "INTEGER DEFAULT 0"),
+                           ("bonus_bio", "INTEGER DEFAULT 0"),
+                           ("bio", "TEXT DEFAULT ''"),
+                           ("profile_checked", "TEXT DEFAULT ''")):
             if name not in _tcols:
                 c.execute(f"ALTER TABLE tg_users ADD COLUMN {name} {decl}")
         c.commit()
@@ -342,7 +561,8 @@ def refresh_quota(tg_id: int) -> int:
     k = user_key(tg_id)
     if not u or not k:
         return 0
-    limit = daily_amount(u["rank"]) + int(u["bonus_tokens"] or 0)
+    limit = (daily_amount(u["rank"]) + int(u["bonus_tokens"] or 0)
+             + int(u["bonus_name"] or 0) + int(u["bonus_bio"] or 0))
     if int(u["rank"] or 0) >= 1 and checked_in_today(u):
         limit += CHECKIN_TOKENS
     with db() as c:
@@ -358,6 +578,85 @@ def total_used(tg_id: int) -> int:
     life = int(u["lifetime_tokens"] or 0) if u else 0
     today = key_stats(k["id"])["billed"] if k else 0
     return life + today
+
+
+# ── бонусы за профиль: @cer_ai в имени и в описании ─────────────────
+# Имя/фамилию и bio бот берёт через getChat (поле bio доступно для личных чатов).
+# Результат кэшируется, чтобы меню открывалось мгновенно.
+_profile_cache: dict[int, tuple[float, dict]] = {}
+
+
+def _tag_in(text: str) -> bool:
+    return bool(BONUS_TAG) and BONUS_TAG in (text or "").lower()
+
+
+def _bio_is_ad(text: str) -> bool:
+    low = (text or "").lower()
+    if not _tag_in(low):
+        return False
+    return "бесплатн" in low and ("клод" in low or "claude" in low)
+
+
+async def fetch_profile(uid: int, force: bool = False) -> Optional[dict]:
+    now = time.time()
+    if not force:
+        hit = _profile_cache.get(uid)
+        if hit and now - hit[0] < PROFILE_TTL:
+            return hit[1]
+    chat = await api("getChat", chat_id=uid)
+    if not isinstance(chat, dict):
+        return None
+    first = str(chat.get("first_name") or "")
+    last = str(chat.get("last_name") or "")
+    bio = str(chat.get("bio") or "")
+    st = {
+        "first_name": first, "last_name": last, "bio": bio,
+        "name_hit": _tag_in(f"{first} {last}"),
+        "bio_hit": _bio_is_ad(bio),
+    }
+    _profile_cache[uid] = (now, st)
+    return st
+
+
+async def refresh_profile_bonuses(uid: int, force: bool = False) -> dict:
+    """Перепроверить ник/bio и обновить бонусы в лимите."""
+    st = await fetch_profile(uid, force)
+    if st is None:
+        return {"changed": False, "unknown": True}
+    u = get_user(uid)
+    if not u:
+        return {"changed": False}
+    b_name = BONUS_NAME if st["name_hit"] else 0
+    b_bio = BONUS_BIO if st["bio_hit"] else 0
+    changed = (int(u["bonus_name"] or 0) != b_name) or (int(u["bonus_bio"] or 0) != b_bio)
+    with db() as c:
+        c.execute("UPDATE tg_users SET bonus_name=?, bonus_bio=?, bio=?, profile_checked=? "
+                  "WHERE tg_id=?", (b_name, b_bio, st["bio"][:500], now_iso(), uid))
+        c.commit()
+    if changed:
+        log_event(uid, "profile_bonus", f"name={b_name} bio={b_bio}")
+        refresh_quota(uid)
+    return {"changed": changed, "name_hit": st["name_hit"], "bio_hit": st["bio_hit"],
+            "bonus": b_name + b_bio, "bio": st["bio"],
+            "first_name": st["first_name"], "last_name": st["last_name"]}
+
+
+async def profile_loop() -> None:
+    while True:
+        await asyncio.sleep(PROFILE_CHECK_EVERY)
+        try:
+            with db() as c:
+                rows = c.execute("SELECT tg_id FROM tg_users WHERE banned=0").fetchall()
+            for r in rows:
+                uid = int(r["tg_id"])
+                res = await refresh_profile_bonuses(uid, force=True)
+                if res.get("changed"):
+                    u = get_user(uid)
+                    if u and res.get("bonus"):
+                        await send(uid, f"🎁 Бонус за профиль: +{human(res['bonus'])} к дневному лимиту.")
+                await asyncio.sleep(0.05)
+        except Exception as e:                   # noqa: BLE001
+            log.warning("profile loop: %r", e)
 
 
 def daily_reset() -> list[int]:
@@ -401,11 +700,11 @@ def sync_rank(tg_id: int) -> tuple[int, int]:
     if not u:
         return 0, 0
     k = user_key(tg_id)
+    old = int(u["rank"] or 0)
+    if int(u["rank_manual"] or 0) or old == 0:
+        return old, old          # ранг выдан вручную или ещё нет чек-ина — не трогаем
     used = total_used(tg_id)
     want = rank_for(used, confirmed_refs(tg_id))
-    old = int(u["rank"] or 0)
-    if old == 0:
-        return 0, 0                      # без чек-ина ранг не растёт
     if want != old:
         with db() as c:
             c.execute("UPDATE tg_users SET rank=? WHERE tg_id=?", (want, tg_id))
@@ -653,6 +952,13 @@ def human(n: int) -> str:
     return str(n)
 
 
+def limit_text(rank: int, limit: int) -> str:
+    """Как показывать квоту: до чек-ина её нет, без лимита — «∞»."""
+    if int(rank or 0) == 0 and not int(limit or 0):
+        return "—"
+    return human(limit) if int(limit or 0) else INF
+
+
 def bar(done: int, total: int, width: int = 10) -> str:
     if total <= 0:
         return "▰" * width
@@ -685,24 +991,46 @@ _probe_cache: dict[str, Any] = {"at": 0.0, "data": None}
 
 
 async def probe_models(force: bool = False) -> dict:
-    """Статус моделей через /health/deep прокси (один мелкий запрос на модель)."""
+    """Статус моделей через /health/deep прокси (один мелкий запрос на модель).
+
+    503 — это НОРМАЛЬНЫЙ ответ: прокси так сигналит «часть моделей лежит», но
+    тело с каналами и миллисекундами приходит полностью. Поэтому парсим JSON
+    при любом статусе; если тело без каналов — показываем список моделей из базы
+    со статусом «неизвестно», чтобы экран не был пустым.
+    """
     now = time.time()
     if not force and _probe_cache["data"] is not None and now - _probe_cache["at"] < PROBE_TTL:
         return _probe_cache["data"]
     if client is None:
         return {"error": "нет HTTP-клиента"}
+    err = ""
     try:
         r = await client.get(f"{PROXY_BASE}/health/deep",
-                             params={"key": PROXY_ADMIN_KEY}, timeout=40.0)
-        if r.status_code >= 400:
-            return {"error": f"HTTP {r.status_code}"}
+                             params={"key": PROXY_ADMIN_KEY}, timeout=90.0)
         data = r.json() or {}
         channels = data.get("channels") or {}
-        _probe_cache["at"] = now
-        _probe_cache["data"] = channels
-        return channels
+        if channels:
+            _probe_cache["at"] = now
+            _probe_cache["data"] = channels
+            return channels
+        err = f"HTTP {r.status_code}: нет поля channels"
     except Exception as e:
-        return {"error": repr(e)[:120]}
+        err = repr(e)[:120]
+    # прокси молчит или старый билд — показываем модели из базы
+    fallback = {}
+    try:
+        with db() as c:
+            rows = c.execute("SELECT fake_model, enabled FROM mappings ORDER BY id").fetchall()
+        fallback = {r["fake_model"]: {"state": "unknown" if r["enabled"] else "no-upstream"}
+                    for r in rows}
+    except Exception:
+        pass
+    if fallback:
+        fallback["_note"] = f"прокси не ответил ({err})"
+        _probe_cache["at"] = now
+        _probe_cache["data"] = fallback
+        return fallback
+    return {"error": err or "прокси недоступен"}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -710,24 +1038,62 @@ async def probe_models(force: bool = False) -> dict:
 # ══════════════════════════════════════════════════════════════════════
 
 
+_USER_FIELDS = ("tg_id", "username", "first_name", "rank", "referred_by", "ref_confirmed",
+                "checkin_at", "banned", "created_at", "last_seen", "note",
+                "lifetime_tokens", "bonus_tokens", "last_reset", "subscribed",
+                "last_sub_check", "rank_manual", "bonus_name", "bonus_bio", "bio")
+
+_STATS_SQL = """
+    SELECT u.*,
+           k.id          AS k_id,
+           k.public_key  AS k_public_key,
+           k.rpm_limit   AS k_rpm_limit,
+           k.enabled     AS k_enabled,
+           k.token_limit AS k_token_limit,
+           COALESCE(ku.billed_tokens, 0) AS u_used,
+           COALESCE(ku.requests, 0)      AS u_requests,
+           (SELECT COUNT(*) FROM tg_users r WHERE r.referred_by = u.tg_id) AS refs_all,
+           (SELECT COUNT(*) FROM tg_users r WHERE r.referred_by = u.tg_id
+                                               AND r.ref_confirmed = 1)   AS refs_conf
+      FROM tg_users u
+      LEFT JOIN api_keys k ON k.id = (SELECT id FROM api_keys WHERE tg_id = u.tg_id
+                                      ORDER BY id DESC LIMIT 1)
+      LEFT JOIN key_usage ku ON ku.key_id = k.id
+     WHERE u.tg_id = ?
+"""
+
+
 def user_stats(tg_id: int) -> dict:
-    u = get_user(tg_id)
-    k = user_key(tg_id)
-    st = key_stats(k["id"]) if k else {"requests": 0, "billed": 0, "in": 0, "out": 0, "last": ""}
-    rank = int(u["rank"] or 0) if u else 0
+    """Всё для экранов одним запросом — в Postgres каждый запрос это round-trip."""
+    with db() as c:
+        row = c.execute(_STATS_SQL, (tg_id,)).fetchone()
+    if row is None:
+        return {"user": None, "key": None, "rank": 0, "used": 0, "requests": 0,
+                "limit": 0, "refs": 0, "refs_all": 0, "cap": "none"}
+    raw = dict(row)
+    user = {f: raw.get(f) for f in _USER_FIELDS}
+    key = None
+    if raw.get("k_id"):
+        key = {"id": raw["k_id"], "public_key": raw.get("k_public_key"),
+               "rpm_limit": raw.get("k_rpm_limit"), "enabled": raw.get("k_enabled"),
+               "token_limit": raw.get("k_token_limit")}
+    rank = int(user.get("rank") or 0)
     return {
-        "user": u, "key": k, "rank": rank,
-        "used": st["billed"], "requests": st["requests"],
-        "limit": int(k["token_limit"] or 0) if k else 0,
-        "refs": confirmed_refs(tg_id), "refs_all": total_refs(tg_id),
-        "cap": "unlimited" if not k or not k["token_limit"] else "limited",
+        "user": user, "key": key, "rank": rank,
+        "used": int(raw.get("u_used") or 0),
+        "requests": int(raw.get("u_requests") or 0),
+        "limit": int((key or {}).get("token_limit") or 0),
+        "refs": int(raw.get("refs_conf") or 0),
+        "refs_all": int(raw.get("refs_all") or 0),
+        "cap": "unlimited" if not key or not (key.get("token_limit") or 0) else "limited",
     }
 
 
 def render_menu(tg_id: int, name: str) -> tuple[str, dict]:
     s = user_stats(tg_id)
     u = s["user"]
-    left = "∞" if not s["limit"] else human(max(0, s["limit"] - s["used"]))
+    left = ("—" if s["rank"] == 0 and not s["limit"]
+            else INF if not s["limit"] else human(max(0, s["limit"] - s["used"])))
     main = kb([
         [btn("📊 Статус моделей", "m:models"), btn("👤 Профиль", "m:profile")],
         [btn("🎁 Реферальная программа", "m:ref"), btn("🏅 Ранг", "m:rank")],
@@ -745,7 +1111,7 @@ def render_menu(tg_id: int, name: str) -> tuple[str, dict]:
         f"{SEP}\n"
         f"{esc(name)} · <code>{tg_id}</code>\n"
         f"Ранг — {rank_title(s['rank'])}\n"
-        f"Сегодня — <b>{human(s['used'])}</b> / <b>{human(s['limit']) or INF}</b>\n"
+        f"Сегодня — <b>{human(s['used'])}</b> / <b>{limit_text(s['rank'], s['limit'])}</b>\n"
         f"Осталось — <b>{left}</b> · сброс в 00:00\n"
         f"{SEP}\n"
         f"<i>Квота обновляется каждый день.</i>"
@@ -755,10 +1121,10 @@ def render_menu(tg_id: int, name: str) -> tuple[str, dict]:
 
 def render_profile(tg_id: int) -> tuple[str, dict]:
     s = user_stats(tg_id)
-    u, k = s["user"], s["key"]
+    u, k = s["user"] or {}, s["key"] or {}
     used, limit = s["used"], s["limit"]
     pct = f"{bar(used, limit)}  {int(min(1.0, used / limit) * 100) if limit else 100}%" if limit else ""
-    uname = f"@{esc(u['username'])}" if u and u["username"] else "—"
+    uname = f"@{esc(u['username'])}" if u.get("username") else "—"
     text = (
         f"👤 <b>Профиль</b>\n{SEP}\n"
         f"ID: <code>{tg_id}</code>\n"
@@ -766,16 +1132,17 @@ def render_profile(tg_id: int) -> tuple[str, dict]:
         f"Ранг: {rank_title(s['rank'])}\n"
         f"Ключ: <code>{esc(mask_key(k['public_key']) if k else '—')}</code>\n"
         f"{SEP}\n"
-        f"Сегодня: <b>{human(used)}</b> / <b>{human(limit) or INF}</b>\n"
+        f"Сегодня: <b>{human(used)}</b> / <b>{limit_text(s['rank'], limit)}</b>\n"
         f"{pct}\n"
         f"Дневная норма: {human(daily_amount(s['rank']))}"
         f" · чек-ин: {'✅ ' + human(CHECKIN_TOKENS) if checked_in_today(u) else 'не взят'}\n"
+        f"Бонусы: ник {human(u['bonus_name'] or 0)} · био {human(u['bonus_bio'] or 0)}\n"
         f"Сброс квоты: 00:00 (через {hours_to_reset()} ч)\n"
         f"Всего сожжено: <b>{human(total_used(tg_id))}</b>\n"
         f"Запросов сегодня: <b>{s['requests']}</b>\n"
         f"Рефералы: <b>{s['refs']}</b> подтверждено · {s['refs_all']} всего\n"
-        f"Регистрация: {esc((u['created_at'] if u else '')[:16])}\n"
-        f"Последняя активность: {esc((u['last_seen'] if u else '')[:16])}"
+        f"Регистрация: {esc((u.get('created_at') or '')[:16])}\n"
+        f"Последняя активность: {esc((u.get('last_seen') or '')[:16])}"
     )
     rows = [
         [btn("📋 Скопировать ключ", "m:copykey"), btn("📋 Скопировать base_url", "m:copyurl")],
@@ -898,24 +1265,39 @@ def render_rank(tg_id: int) -> tuple[str, dict]:
 # ══════════════════════════════════════════════════════════════════════
 
 
+def table_exists(c, table: str) -> bool:
+    """Есть ли таблица (по-разному в sqlite и postgres)."""
+    if PG_MODE:
+        return bool(c.execute("SELECT 1 FROM information_schema.tables "
+                              "WHERE table_schema='public' AND table_name=?",
+                              (table,)).fetchone())
+    return bool(c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                          (table,)).fetchone())
+
+
 def admin_stats() -> dict:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d") + "%"
     with db() as c:
-        users = c.execute("SELECT COUNT(*) FROM tg_users").fetchone()[0]
-        banned = c.execute("SELECT COUNT(*) FROM tg_users WHERE banned=1").fetchone()[0]
-        keys = c.execute("SELECT COUNT(*) FROM api_keys").fetchone()[0]
-        u = c.execute("""SELECT COALESCE(SUM(requests),0), COALESCE(SUM(billed_tokens),0)
-                         FROM key_usage""").fetchone()
-        models = c.execute("SELECT COUNT(*) FROM mappings").fetchone()[0] \
-            if c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='mappings'").fetchone() else 0
-        ups = c.execute("SELECT COUNT(*) FROM upstreams").fetchone()[0] \
-            if c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='upstreams'").fetchone() else 0
-        ranks = dict(c.execute("SELECT rank, COUNT(*) FROM tg_users GROUP BY rank").fetchall())
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        new_today = c.execute("SELECT COUNT(*) FROM tg_users WHERE created_at LIKE ?",
-                              (today + "%",)).fetchone()[0]
-    return {"users": users, "banned": banned, "keys": keys, "requests": u[0] or 0,
-            "tokens": u[1] or 0, "models": models, "ups": ups, "ranks": ranks,
-            "new_today": new_today}
+        r = c.execute("""
+            SELECT (SELECT COUNT(*) FROM tg_users) AS n_users,
+                   (SELECT COUNT(*) FROM tg_users WHERE banned=1) AS n_banned,
+                   (SELECT COUNT(*) FROM api_keys) AS n_keys,
+                   (SELECT COALESCE(SUM(requests),0) FROM key_usage) AS sum_req,
+                   (SELECT COALESCE(SUM(billed_tokens),0) FROM key_usage) AS sum_tok,
+                   (SELECT COUNT(*) FROM tg_users WHERE created_at LIKE ?) AS n_new
+        """, (today,)).fetchone()
+        ranks = {int(x[0] or 0): int(x[1]) for x in c.execute(
+            "SELECT rank, COUNT(*) FROM tg_users GROUP BY rank").fetchall()}
+        models = (c.execute("SELECT COUNT(*) FROM mappings").fetchone()[0]
+                  if table_exists(c, "mappings") else 0)
+        ups = (c.execute("SELECT COUNT(*) FROM upstreams").fetchone()[0]
+               if table_exists(c, "upstreams") else 0)
+        unlim = c.execute("SELECT COUNT(*) FROM api_keys "
+                          "WHERE COALESCE(token_limit,0)=0").fetchone()[0]
+    return {"users": r["n_users"], "banned": r["n_banned"], "keys": r["n_keys"],
+            "requests": r["sum_req"] or 0, "tokens": r["sum_tok"] or 0,
+            "models": models, "ups": ups, "ranks": ranks,
+            "new_today": r["n_new"], "unlimited": unlim}
 
 
 def render_admin_home() -> tuple[str, dict]:
@@ -930,6 +1312,7 @@ def render_admin_home() -> tuple[str, dict]:
         f"🧩 Моделей: <b>{s['models']}</b> · 🏦 Апстримов: <b>{s['ups']}</b>\n"
         f"{SEP}\n"
         f"📊 Ранги: 🌱 {s['ranks'].get(1,0)} · ⚡ {s['ranks'].get(2,0)} · 👑 {s['ranks'].get(3,0)}"
+        + (f"\n🔓 Безлимитных ключей: <b>{s['unlimited']}</b>" if s.get("unlimited") else "")
     )
     rows = [
         [btn("👥 Пользователи", "a:users:0"), btn("🩺 Диагностика", "a:probe")],
@@ -940,6 +1323,7 @@ def render_admin_home() -> tuple[str, dict]:
         [btn("🔎 Поиск", "a:search"), btn("🚫 Баны", "a:bans")],
         [btn("📤 Экспорт CSV", "a:csv"), btn("🧹 Сервис", "a:service")],
         [btn("⚙️ Настройки", "a:settings"), btn("🧾 События", "a:events")],
+        [btn("🔓 Безлимитные ключи", "a:unlim")],
         [btn("◀ В меню", "m:menu")],
     ]
     return text, kb(rows)
@@ -984,13 +1368,15 @@ def render_admin_user(tg_id: int) -> tuple[str, dict]:
         f"👤 <b>Пользователь {tg_id}</b>\n{SEP}\n"
         f"Username: @{esc(u['username']) or '—'}\n"
         f"Имя: {esc(u['first_name'])}\n"
-        f"Ранг: {rank_title(u['rank'])}\n"
+        f"Ранг: {rank_title(u['rank'])}{' 🔒' if int(u['rank_manual'] or 0) else ''}\n"
         f"Ключ: <code>{esc(mask_key(k['public_key']) if k else '—')}</code>\n"
         f"Токены сегодня: <b>{human(st['billed'])}</b> / <b>{human((k['token_limit'] if k else 0)) or INF}</b>\n"
         f"Всего сожжено: <b>{human(total_used(tg_id))}</b>\n"
         f"Запросов: <b>{st['requests']}</b>\n"
         f"Рефералы: {confirmed_refs(tg_id)}/{total_refs(tg_id)}\n"
         f"Подписка: {'✅ есть' if u['subscribed'] else '❌ нет'}\n"
+        f"Бонусы: ник {human(u['bonus_name'] or 0)} · био {human(u['bonus_bio'] or 0)}\n"
+        f"Био: {esc((u['bio'] or '—')[:60])}\n"
         f"Пригласил: {esc(u['referred_by'] or '—')}\n"
         f"Бан: {'да' if u['banned'] else 'нет'}\n"
         f"Создан: {esc(u['created_at'][:16])}"
@@ -1001,7 +1387,9 @@ def render_admin_user(tg_id: int) -> tuple[str, dict]:
         [btn("🚫 бан" if not u["banned"] else "✅ разбан", f"a:u:{tg_id}:ban"),
          btn("🗑 удалить", f"a:u:{tg_id}:del")],
         [btn("✉️ написать", f"a:u:{tg_id}:dm"), btn("⬆️ ранги пересчитать", f"a:u:{tg_id}:sync")],
-        [btn("🔄 проверить подписку", f"a:u:{tg_id}:sub")],
+        [btn("🔄 проверить подписку", f"a:u:{tg_id}:sub"),
+         btn("🎁 проверить профиль", f"a:u:{tg_id}:prof")],
+        [btn("♻️ авто-ранг", f"a:u:{tg_id}:autorank")],
         [btn("◀ Назад", "a:users:0")],
     ]
     return text, kb(rows)
@@ -1013,7 +1401,7 @@ def render_admin_models() -> tuple[str, dict]:
             rows = c.execute("""SELECT fake_model, real_model, upstream_id, enabled, endpoint_mode,
                                        context_length, system_prompt
                                 FROM mappings ORDER BY id""").fetchall()
-    except sqlite3.OperationalError:
+    except DB_ERRORS:
         return ("🧩 <b>Модели</b>\n" + SEP + "\nБаза прокси ещё не создала таблицу <code>mappings</code>.",
                 kb([[btn("🔄", "a:models"), btn("◀ Админка", "a:home")]]))
     lines = [f"🧩 <b>Модели</b>\n{SEP}"]
@@ -1033,7 +1421,7 @@ def render_admin_ups() -> tuple[str, dict]:
     try:
         with db() as c:
             rows = c.execute("SELECT id, name, url, enabled FROM upstreams ORDER BY id").fetchall()
-    except sqlite3.OperationalError:
+    except DB_ERRORS:
         return ("🏦 <b>Апстримы</b>\n" + SEP + "\nТаблица <code>upstreams</code> ещё не создана.",
                 kb([[btn("🔄", "a:ups"), btn("◀ Админка", "a:home")]]))
     lines = [f"🏦 <b>Апстримы</b>\n{SEP}"]
@@ -1044,6 +1432,33 @@ def render_admin_ups() -> tuple[str, dict]:
         buttons.append([btn(f"{mark} #{r['id']} {r['name'][:18]}", f"a:up:{r['id']}")])
     buttons.append([btn("◀ Админка", "a:home")])
     return ("\n".join(lines), kb(buttons))
+
+
+def unlimited_keys() -> list:
+    """Ключи, у которых token_limit=0 — в учёте это «без лимита»."""
+    try:
+        with db() as c:
+            return c.execute("SELECT id, tg_id, note, public_key FROM api_keys "
+                             "WHERE COALESCE(token_limit,0)=0 ORDER BY id").fetchall()
+    except DB_ERRORS:
+        return []
+
+
+def render_unlimited() -> tuple[str, dict]:
+    rows = unlimited_keys()
+    lines = [f"🔓 <b>Безлимитные ключи</b>\n{SEP}"]
+    for r in rows:
+        who = f"tg {r['tg_id']}" if r["tg_id"] else "панель"
+        lines.append(f"#{r['id']} · {who} · <code>{esc(mask_key(r['public_key']))}</code>")
+    if not rows:
+        lines.append("нет — у всех ключей есть лимит")
+    else:
+        lines.append(f"\n<i>Кнопка выставит {human(BOT_DEFAULT_LIMIT)} токенов.</i>")
+    buttons = []
+    if rows:
+        buttons.append([btn(f"🔒 Закрыть все ({len(rows)})", "a:unlim:fix")])
+    buttons.append([btn("◀ Админка", "a:home")])
+    return "\n".join(lines), kb(buttons)
 
 
 def render_admin_top() -> tuple[str, dict]:
@@ -1096,7 +1511,10 @@ def render_settings() -> tuple[str, dict]:
         f"✅ Чек-ин: <b>+{human(CHECKIN_TOKENS)}</b> раз в сутки\n"
         f"⏰ Сброс: <b>00:00</b> (UTC{RESET_TZ_OFFSET:+g})\n{SEP}\n"
         f"Бонус за реферала: <b>{human(REF_BONUS)}</b> (постоянный)\n"
-        f"Подтверждение реферала: <b>{human(REF_CONFIRM_TOKENS)}</b>\n"
+        f"Бонусы профиля: ник <b>+{human(BONUS_NAME)}</b> · био <b>+{human(BONUS_BIO)}</b>\n"
+        f"Тег для бонусов: <b>{esc(BONUS_TAG)}</b>\n"
+        f"Подтверждение реферала: <b>{REF_CONFIRM_REQUESTS}</b> запросов + подписка\n"
+        f"Обязательная подписка: <b>{esc(REQUIRED_CHANNEL_ID or '—')}</b> / <b>{esc(REQUIRED_CHAT_ID or '—')}</b>\n"
         f"Профи: <b>{human(RANK2_TOKENS)}</b> всего + <b>{RANK2_REFS}</b> реф.\n"
         f"Легенда: <b>{human(RANK3_TOKENS)}</b> всего + <b>{RANK3_REFS}</b> реф.\n"
         f"RPM по умолчанию: <b>{DEFAULT_RPM}</b>\n"
@@ -1138,6 +1556,7 @@ async def on_start(tg_id: int, name: str, username: str, payload: str) -> None:
         if referred_by:
             log_event(referred_by, "referral", f"new user {tg_id}")
     refresh_quota(tg_id)
+    await refresh_profile_bonuses(tg_id, force=True)
     if tg_id != ADMIN_ID:
         ok_sub, missing = await subscription_state(tg_id, force=True)
         apply_subscription(tg_id, ok_sub)
@@ -1189,6 +1608,7 @@ async def on_callback(cq: dict) -> None:
             return
 
         if data == "m:menu":
+            await refresh_profile_bonuses(tg_id)
             u = get_user(tg_id)
             text, markup = render_menu(tg_id, (u["first_name"] if u else "") or str(tg_id))
             await show(chat_id, message_id, text, markup)
@@ -1221,6 +1641,7 @@ async def on_callback(cq: dict) -> None:
             return
 
         if data == "m:profile":
+            await refresh_profile_bonuses(tg_id, force=True)
             sync_rank(tg_id)
             text, markup = render_profile(tg_id)
             await show(chat_id, message_id, text, markup)
@@ -1232,6 +1653,7 @@ async def on_callback(cq: dict) -> None:
             return
 
         if data == "m:rank":
+            await refresh_profile_bonuses(tg_id, force=True)
             sync_rank(tg_id)
             text, markup = render_rank(tg_id)
             await show(chat_id, message_id, text, markup)
@@ -1398,6 +1820,23 @@ async def on_callback(cq: dict) -> None:
             await export_csv(chat_id)
             return
 
+        if data == "a:unlim":
+            text, markup = render_unlimited()
+            await show(chat_id, message_id, text, markup)
+            return
+
+        if data == "a:unlim:fix":
+            rows = unlimited_keys()
+            with db() as c:
+                c.execute("UPDATE api_keys SET token_limit=? WHERE COALESCE(token_limit,0)=0",
+                          (BOT_DEFAULT_LIMIT,))
+                c.commit()
+            log_event(0, "unlim_fix", f"{len(rows)} keys -> {BOT_DEFAULT_LIMIT}")
+            await answer_cb(cb_id, f"выставлен лимит {len(rows)} ключам", alert=True)
+            text, markup = render_unlimited()
+            await show(chat_id, message_id, text, markup)
+            return
+
         if data == "a:bonus":
             INPUT[tg_id] = {"kind": "bonus"}
             await send(chat_id, "🎁 <b>Выдать токены</b>\n\nОтправь: <code>id сумма</code>\n"
@@ -1509,6 +1948,22 @@ async def admin_user_action(chat_id: int, message_id: Optional[int], cq: dict,
         text, markup = render_admin_user(uid)
         await show(chat_id, message_id, text, markup)
         return
+    if action == "prof":
+        res = await refresh_profile_bonuses(uid, force=True)
+        await answer_cb(cb_id, f"ник +{human(BONUS_NAME if res.get('name_hit') else 0)} · "
+                               f"био +{human(BONUS_BIO if res.get('bio_hit') else 0)}", alert=True)
+        text, markup = render_admin_user(uid)
+        await show(chat_id, message_id, text, markup)
+        return
+    if action == "autorank":
+        with db() as c:
+            c.execute("UPDATE tg_users SET rank_manual=0 WHERE tg_id=?", (uid,))
+            c.commit()
+        old, new = sync_rank(uid)
+        await answer_cb(cb_id, f"авто-ранг: {old} → {new}", alert=True)
+        text, markup = render_admin_user(uid)
+        await show(chat_id, message_id, text, markup)
+        return
 
 
 async def export_csv(chat_id: int) -> None:
@@ -1599,11 +2054,11 @@ async def on_text(msg: dict) -> None:
             uid_s, rank_s = text.split()[:2]
             uid, rank = int(uid_s), max(0, min(3, int(rank_s)))
             with db() as c:
-                c.execute("UPDATE tg_users SET rank=? WHERE tg_id=?", (rank, uid))
+                c.execute("UPDATE tg_users SET rank=?, rank_manual=1 WHERE tg_id=?", (rank, uid))
                 c.execute("UPDATE api_keys SET rank=? WHERE tg_id=?", (rank, uid))
                 c.commit()
             refresh_quota(uid)
-            log_event(uid, "setrank", str(rank))
+            log_event(uid, "setrank", f"{rank} manual")
             await send(tg_id, f"✅ {uid} → ранг {rank}")
             t, m = render_admin_user(uid)
             await send(tg_id, t, m)
@@ -1653,11 +2108,11 @@ async def on_callback_rank_choice(data: str) -> None:
     _, _, uid_s, rank_s = data.split(":")
     uid, rank = int(uid_s), int(rank_s)
     with db() as c:
-        c.execute("UPDATE tg_users SET rank=? WHERE tg_id=?", (rank, uid))
+        c.execute("UPDATE tg_users SET rank=?, rank_manual=1 WHERE tg_id=?", (rank, uid))
         c.execute("UPDATE api_keys SET rank=? WHERE tg_id=?", (rank, uid))
         c.commit()
     refresh_quota(uid)
-    log_event(uid, "setrank", str(rank))
+    log_event(uid, "setrank", f"{rank} manual")
     t, m = render_admin_user(uid)
     await send(ADMIN_ID, t, m)
 
@@ -1725,7 +2180,7 @@ async def main() -> None:
     log.info("bot @%s up | db=%s | proxy=%s | admin=%s",
              _me.get("username"), DB_FILE, PROXY_BASE, ADMIN_ID)
     try:
-        await asyncio.gather(poll_loop(), tick_loop(), enforce_loop())
+        await asyncio.gather(poll_loop(), tick_loop(), enforce_loop(), profile_loop())
     finally:
         await client.aclose()
 
