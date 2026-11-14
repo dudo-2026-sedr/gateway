@@ -51,6 +51,8 @@ from typing import Any, AsyncIterator, Optional
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request, Form, Depends, HTTPException
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import (HTMLResponse, StreamingResponse, JSONResponse,
                                RedirectResponse, FileResponse)
 from fastapi.security import APIKeyQuery
@@ -350,6 +352,11 @@ def token_quota_state(key_rec: dict) -> tuple[bool, int, int]:
     if limit <= 0:
         return True, used, 0
     return used < limit, used, limit
+
+
+def quota_exhausted_message(used: int, limit: int) -> str:
+    return (f"Токены израсходованы: {used} из {limit}. "
+            f"Лимит токенов этого ключа исчерпан, доступ остановлен.")
 
 
 async def bump_usage(key_id: Optional[int], in_tok: int = 0, out_tok: int = 0) -> None:
@@ -859,6 +866,75 @@ def resolve_custom_error(raw_text: str, status_code: int = 400) -> str:
     except Exception:
         pass
     return extract_original_error_message(raw_text) or DEFAULT_ERROR_MESSAGE
+
+
+# Канонические тексты по статусу: клиент не должен видеть китайский текст
+# апстрима, имя его модели или URL панели в теле нашей ошибки.
+_STATUS_ERROR_TEXT = {
+    400: "Invalid request",
+    401: "Invalid API key",
+    402: "Credit balance is too low",
+    403: "Forbidden",
+    404: "Not found",
+    405: "Method Not Allowed",
+    408: "Request timeout",
+    413: "Request entity too large",
+    415: "Unsupported Media Type",
+    422: "Invalid request",
+    429: "Rate limit exceeded",
+    500: "Internal server error",
+    501: "Internal server error",
+    502: "Overloaded",
+    503: "Overloaded",
+    504: "Request timeout",
+    507: "Overloaded",
+    529: "Overloaded",
+}
+
+
+def upstream_error_text(status: int, raw_text: str, model: str = "",
+                        real_model: str = "") -> str:
+    """Текст ошибки апстрима, пригодный для клиента.
+
+    Правила из error_rules главнее (их задаёт владелец шлюза), 5xx уходят
+    статусным текстом, 4xx — канонической строкой. Сырой текст остаётся
+    только в логах.
+
+    Если провайдер жалуется именно на модель (в его тексте есть настоящее имя
+    модели), клиент видит внятное сообщение с ПУБЛИЧНЫМ именем модели — а не
+    «deepseek-v4.1-flash сейчас недоступна» и не сухое "Invalid request".
+    """
+    try:
+        hay = (raw_text or "").lower()
+        for rule in sorted(ERROR_RULES, key=lambda r: r.get("id", 0)):
+            trig = (rule.get("trigger") or "").strip().lower()
+            if trig and trig in hay:
+                return rule.get("message") or _STATUS_ERROR_TEXT.get(status, "Request failed")
+    except Exception:
+        pass
+    if status < 500 and model and real_model:
+        base = str(real_model).split("/")[-1].strip().lower()
+        if base and base in hay:
+            return (f"Model {model} is currently unavailable. "
+                    f"Pick another model from the list.")
+    if status in _STATUS_ERROR_TEXT:
+        return _STATUS_ERROR_TEXT[status]
+    return "Invalid request" if status < 500 else "Internal server error"
+
+
+def upstream_body_error_status(data: Any) -> int:
+    """Статус для случая, когда апстрим ответил 200, но в теле лежит error.
+
+    Такое бывает у прокси-провайдеров: транспорт успешен, а модель не найдена
+    или ключ отозван. Код берём из их же поля error.code, если он осмысленный.
+    """
+    err = data.get("error") if isinstance(data, dict) else None
+    code = err.get("code") if isinstance(err, dict) else None
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        code = 0
+    return code if 400 <= code <= 599 else 500
 
 
 def branded_error(owned_by: Optional[str], message: str, code: int,
@@ -1510,11 +1586,9 @@ def gw_headers(req_id: str, is_stream: bool = False, model: str = "",
 
 
 def err_oai(err_type: str, msg: str, code: int, req_id: str, model: str = "") -> JSONResponse:
-    return JSONResponse(
-        {"error": {"message": sanitize_text(msg), "type": err_type,
-                   "param": None, "code": err_type}},
-        status_code=code, headers=gw_headers(req_id, model=model, provider="openai"),
-    )
+    # Клиент, которому отдали Claude-эндпоинт, не должен по ошибке понять, что
+    # это шлюз: тело ошибки всегда в формате Anthropic, даже на OpenAI-пути.
+    return anth_error_response(code, msg, req_id, err_type=err_type, model=model)
 
 
 # ── Anthropic 2026 request surface ────────────────────────────────────
@@ -1589,16 +1663,41 @@ def anth_request_meta(req) -> tuple:
 
 
 def err_ant(err_type: str, msg: str, code: int, req_id: str, model: str = "") -> JSONResponse:
-    # Anthropic always echoes request_id at the top level of an error body.
-    h = gw_headers(req_id, model=model, provider="anthropic")
-    if code in (429, 529):
-        # overloaded/limited responses carry retry-after, as the SDKs expect
-        h["retry-after"] = "5" if code == 529 else "1"
+    return anth_error_response(code, msg, req_id, err_type=err_type, model=model)
+
+
+def anth_error_response(status: int, message: str, req_id: str = "",
+                       err_type: str = "", model: str = "",
+                       retry_after: str = "") -> JSONResponse:
+    """Единственная точка сборки ошибок: тело в формате Anthropic, заголовки провайдера.
+
+    code прогоняется через map_status_ant (502->529 и т.п.), тип берётся из
+    _ANTH_ERROR_BY_CODE, если не задан явно. Модель неизвестна — всё равно
+    притворяемся Anthropic: иначе на 404 по несуществующей модели утечёт наше имя.
+    """
+    rid = req_id or ("req_01" + gen_b62(22))
+    st = map_status_ant(status)
+    et = err_type or map_err_ant(st)
+    # У Anthropic статус 529 бывает только с overloaded_error, 504 — с timeout_error:
+    # явно переданный тип их не перебивает.
+    if st == 529:
+        et = "overloaded_error"
+    elif st == 504:
+        et = "timeout_error"
+    if model:
+        flav = provider_flavour((MAPPINGS.get(model) or {}).get("owned_by"))
+    else:
+        flav = ""
+    h = gw_headers(rid, model=model, provider=flav or "anthropic")
+    if retry_after:
+        h["retry-after"] = retry_after
+    elif st in (429, 529):
+        h["retry-after"] = "5" if st == 529 else "1"
     return JSONResponse(
         {"type": "error",
-         "error": {"type": err_type, "message": sanitize_text(msg)},
-         "request_id": req_id},
-        status_code=code, headers=h,
+         "error": {"type": et, "message": sanitize_text(message)},
+         "request_id": rid},
+        status_code=st, headers=h,
     )
 
 
@@ -1613,9 +1712,11 @@ def map_err_oai(code: int) -> str:
 
 _ANTH_ERROR_BY_CODE = {
     400: "invalid_request_error", 401: "authentication_error", 402: "billing_error",
-    403: "permission_error", 404: "not_found_error", 409: "conflict_error",
-    413: "request_too_large", 429: "rate_limit_error", 500: "api_error",
-    504: "timeout_error", 529: "overloaded_error",
+    403: "permission_error", 404: "not_found_error", 405: "invalid_request_error",
+    406: "invalid_request_error", 408: "timeout_error", 409: "conflict_error",
+    413: "request_too_large", 415: "invalid_request_error", 422: "invalid_request_error",
+    429: "rate_limit_error", 500: "api_error", 501: "api_error", 502: "api_error",
+    503: "overloaded_error", 504: "timeout_error", 529: "overloaded_error",
 }
 # upstream status -> the status Anthropic would have used
 _ANTH_STATUS = {502: 529, 503: 529, 507: 529, 508: 504, 522: 504, 524: 504}
@@ -2501,6 +2602,49 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
 # ══════════════════════════════════════════════════════════════════════
+#  ГЛОБАЛЬНЫЕ ОШИБКИ
+#  Любой ошибочный ответ — незнакомый путь, неверный метод, битое тело,
+#  непредвиденный сбой — уходит телом Anthropic. Дефолтные "{\"detail\":
+#  \"Not Found\"}" и plain-text "Internal Server Error" от FastAPI выдают
+#  шлюз сразу, поэтому они перехвачены здесь.
+# ══════════════════════════════════════════════════════════════════════
+
+_HTTP_ERROR_TEXT = {
+    404: "Not Found",
+    405: "Method Not Allowed",
+    413: "Request entity too large",
+    415: "Unsupported Media Type",
+    422: "Invalid request body",
+}
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _on_http_error(req: Request, exc: StarletteHTTPException):
+    detail = exc.detail if isinstance(exc.detail, str) else ""
+    msg = detail.strip() or _HTTP_ERROR_TEXT.get(exc.status_code, "Request failed.")
+    return anth_error_response(exc.status_code, msg)
+
+
+@app.exception_handler(RequestValidationError)
+async def _on_validation_error(req: Request, exc: RequestValidationError):
+    msg = "Invalid request body"
+    try:
+        first = (exc.errors() or [{}])[0]
+        loc = ".".join(str(p) for p in (first.get("loc") or ()) if p not in ("body",))
+        text = str(first.get("msg") or "invalid value")
+        if loc:
+            msg = f"{loc}: {text}"
+    except Exception:
+        pass
+    return anth_error_response(400, msg)
+
+
+@app.exception_handler(Exception)
+async def _on_unhandled(req: Request, exc: Exception):
+    log.warning("unhandled error on %s %s: %r", req.method, req.url.path, exc)
+    return anth_error_response(500, "Internal server error")
+
+# ══════════════════════════════════════════════════════════════════════
 #  AUTH
 # ══════════════════════════════════════════════════════════════════════
 
@@ -2591,21 +2735,12 @@ async def openai_chat(req: Request):
 
     ok, remaining, retry = await check_rate(key_rec["id"], key_rec["rpm_limit"])
     if not ok:
-        return JSONResponse(
-            {"error": {"message": f"Rate limit exceeded. Retry in {retry}s.",
-                       "type": "rate_limit_error", "code": "rate_limit_error"}},
-            status_code=429,
-            headers={**gw_headers(req_id), "retry-after": str(retry)},
-        )
+        return anth_error_response(429, f"Rate limit exceeded. Retry in {retry}s.",
+                                   req_id, retry_after=str(retry))
 
     quota_ok, tok_used, tok_limit = token_quota_state(key_rec)
     if not quota_ok:
-        return JSONResponse(
-            {"error": {"message": f"Token quota exhausted for this API key: "
-                                   f"{tok_used} of {tok_limit} tokens used.",
-                       "type": "insufficient_quota", "code": "insufficient_quota"}},
-            status_code=429, headers=gw_headers(req_id),
-        )
+        return anth_error_response(429, quota_exhausted_message(tok_used, tok_limit), req_id)
 
     try:
         body = await req.json()
@@ -2662,12 +2797,20 @@ async def openai_chat(req: Request):
                 await r.aclose()
             if r.status_code >= 400:
                 return err_oai(map_err_oai(r.status_code),
-                               raw.decode("utf-8", "ignore")[:500],
+                               upstream_error_text(r.status_code,
+                                                   raw.decode("utf-8", "ignore"),
+                                                   fake_model, mapping["real_model"]),
                                r.status_code, req_id, fake_model)
             try:
                 data = json.loads(raw)
             except Exception:
                 return err_oai("api_error", "Bad upstream JSON.", 502, req_id, fake_model)
+            if isinstance(data, dict) and data.get("error"):
+                st = upstream_body_error_status(data)
+                return err_oai(map_err_oai(st),
+                               upstream_error_text(st, raw.decode("utf-8", "ignore"),
+                                                   fake_model, mapping["real_model"]),
+                               st, req_id, fake_model)
             calls = extract_search_calls(data)
             if calls and rounds < SEARCH_MAX_ROUNDS:
                 extra = await make_search_round_messages_multi(calls, req_id)
@@ -2730,7 +2873,8 @@ async def openai_chat(req: Request):
         finally:
             await r.aclose()
         return err_oai(map_err_oai(r.status_code),
-                       raw.decode("utf-8", "ignore")[:500],
+                       upstream_error_text(r.status_code, raw.decode("utf-8", "ignore"),
+                                           fake_model, mapping["real_model"]),
                        r.status_code, req_id, fake_model)
 
     fixed_id = new_id("chatcmpl")
@@ -2848,7 +2992,7 @@ async def openai_chat(req: Request):
                         except Exception:
                             pass
                         log.warning("[%s] search round HTTP %s", req_id, cur_r.status_code)
-                        yield (f"data: {json.dumps({'error': {'type': 'api_error', 'message': raw2.decode('utf-8', 'ignore')[:300]}})}\n\n").encode()
+                        yield (f"data: {json.dumps({'error': {'type': 'api_error', 'message': upstream_error_text(cur_r.status_code, raw2.decode('utf-8', 'ignore'), fake_model, mapping["real_model"])}})}\n\n").encode()
                         break
                     continue
 
@@ -3397,6 +3541,8 @@ async def anth_count(req: Request):
         body = await req.json()
     except Exception:
         return err_ant("invalid_request_error", "Invalid JSON.", 400, req_id)
+    if not isinstance(body, dict):
+        return err_ant("invalid_request_error", "Request body must be a JSON object.", 400, req_id)
     to_count: list[dict] = []
     if isinstance(body.get("system"), str):
         to_count.append({"role": "system", "content": body["system"]})
@@ -3421,25 +3567,19 @@ async def anth_messages(req: Request):
 
     ok, remaining, retry = await check_rate(key_rec["id"], key_rec["rpm_limit"])
     if not ok:
-        return JSONResponse(
-            {"type": "error", "error": {"type": "rate_limit_error",
-                                        "message": f"Rate limit exceeded. Retry in {retry}s."},
-             "request_id": req_id},
-            status_code=429,
-            headers={**gw_headers(req_id, provider="anthropic"), "retry-after": str(retry)},
-        )
+        return anth_error_response(429, f"Rate limit exceeded. Retry in {retry}s.",
+                                   req_id, retry_after=str(retry))
 
     quota_ok, tok_used, tok_limit = token_quota_state(key_rec)
     if not quota_ok:
-        return err_ant("permission_error",
-                       f"Token quota exhausted for this API key: {tok_used} of "
-                       f"{tok_limit} tokens used.",
-                       403, req_id)
+        return anth_error_response(429, quota_exhausted_message(tok_used, tok_limit), req_id)
 
     try:
         body = await req.json()
     except Exception:
         return err_ant("invalid_request_error", "Invalid JSON.", 400, req_id)
+    if not isinstance(body, dict):
+        return err_ant("invalid_request_error", "Request body must be a JSON object.", 400, req_id)
 
     fake_model = body.get("model", "")
     mapping = MAPPINGS.get(fake_model)
@@ -3527,12 +3667,20 @@ async def anth_messages(req: Request):
                 await r.aclose()
             if r.status_code >= 400:
                 return err_ant(map_err_ant(r.status_code),
-                               raw.decode("utf-8", "ignore")[:500],
+                               upstream_error_text(r.status_code,
+                                                   raw.decode("utf-8", "ignore"),
+                                                   fake_model, mapping["real_model"]),
                                map_status_ant(r.status_code), req_id, fake_model)
             try:
                 data = json.loads(raw)
             except Exception:
                 return err_ant("api_error", "Bad upstream JSON.", 502, req_id, fake_model)
+            if isinstance(data, dict) and data.get("error"):
+                st = upstream_body_error_status(data)
+                return err_ant(map_err_ant(st),
+                               upstream_error_text(st, raw.decode("utf-8", "ignore"),
+                                                   fake_model, mapping["real_model"]),
+                               map_status_ant(st), req_id, fake_model)
             calls = extract_search_calls(data)
             if calls and rounds < SEARCH_MAX_ROUNDS:
                 extra = await make_search_round_messages_multi(calls, req_id)
@@ -3582,7 +3730,8 @@ async def anth_messages(req: Request):
         finally:
             await r.aclose()
         return err_ant(map_err_ant(r.status_code),
-                       raw.decode("utf-8", "ignore")[:500],
+                       upstream_error_text(r.status_code, raw.decode("utf-8", "ignore"),
+                                           fake_model, mapping["real_model"]),
                        map_status_ant(r.status_code), req_id, fake_model)
 
     msg_id = new_id("msg")
@@ -3794,7 +3943,10 @@ async def anth_messages(req: Request):
                         log.warning("[%s] search round HTTP %s", req_id, cur_r.status_code)
                         yield sse_ev("error", {"type": "error", "error": {
                             "type": map_err_ant(cur_r.status_code),
-                            "message": raw2.decode("utf-8", "ignore")[:300]}})
+                            "message": upstream_error_text(cur_r.status_code,
+                                                           raw2.decode("utf-8", "ignore"),
+                                                           fake_model,
+                                                           mapping["real_model"])}})
                         return
                     continue
 
