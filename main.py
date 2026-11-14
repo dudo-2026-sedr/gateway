@@ -72,6 +72,9 @@ KEEPALIVE_INTERVAL = float(os.getenv("KEEPALIVE_INTERVAL", "15.0"))
 # Во сколько раз расход токенов ключа считается больше настоящего. 2.5 -> клиент,
 # потративший у апстрима 70k, видит у себя 175k.
 TOKEN_MULTIPLIER = float(os.getenv("TOKEN_MULTIPLIER", "2.5"))
+# Лимит по умолчанию для ключей, создаваемых из админки: раньше там стоял 0,
+# а 0 в нашем учёте = «без лимита», из-за чего ключи выходили безлимитными.
+DEFAULT_KEY_TOKENS = int(os.getenv("DEFAULT_KEY_TOKENS", "3000000"))
 # Хвост к системной инструкции модели. Без него модель по просьбе клиента
 # пересказывает системный промпт — это единственный канал, по которому
 # клиент может узнать про инструкцию шлюза.
@@ -185,11 +188,214 @@ SYSTEM_FINGERPRINT = f"fp_{''.join(secrets.choice(B62) for _ in range(22))}"
 NOESPHERE_ORG = "org-noetic-labs"
 
 # ══════════════════════════════════════════════════════════════════════
+#  БАЗА: SQLite или PostgreSQL
+#  По умолчанию — локальный SQLite-файл. Если задан DATABASE_URL
+#  (Railway / Supabase), всё уходит в Postgres и переживает редеплой.
+#  SQL в коде один: «?» превращается в «%s», а sqlite-специфика
+#  (PRAGMA, AUTOINCREMENT, MAX(a,b)) переводится на лету.
+# ══════════════════════════════════════════════════════════════════════
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+PG_MODE = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+
+if PG_MODE:
+    try:
+        import psycopg  # type: ignore
+    except ImportError as _e:  # pragma: no cover
+        raise RuntimeError("DATABASE_URL задан, но psycopg не установлен: "
+                           "pip install 'psycopg[binary]'") from _e
+    DB_ERRORS: tuple = (sqlite3.Error, psycopg.Error)
+else:
+    DB_ERRORS = (sqlite3.Error,)
+
+
+class DbRow(dict):
+    """Строка, у которой работает и r["col"], и r[0]."""
+
+    def __init__(self, cols, vals):
+        super().__init__((c, v) for c, v in zip(cols, vals))
+        self._vals = tuple(vals)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._vals[key]
+        return super().__getitem__(key)
+
+
+def _sql_fix(sql: str) -> str:
+    """Перевод sqlite-SQL в Postgres."""
+    out = sql.replace("?", "%s")
+    out = re.sub(r"\bAUTOINCREMENT\b", "", out, flags=re.I)
+    out = re.sub(r"\bINTEGER\s+PRIMARY\s+KEY\b", "BIGSERIAL PRIMARY KEY", out, flags=re.I)
+    # MAX(a, b) / MIN(a, b) в sqlite скалярные, в PG — GREATEST/LEAST
+    out = re.sub(r"\bMAX\s*\(", "GREATEST(", out, flags=re.I)
+    out = re.sub(r"\bMIN\s*\(", "LEAST(", out, flags=re.I)
+    return out
+
+
+def _split_sql(script: str) -> list[str]:
+    """Разбить executescript на отдельные запросы (кавычки учитываются)."""
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: Optional[str] = None
+    for ch in script:
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            continue
+        if ch == ";":
+            parts.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    if "".join(buf).strip():
+        parts.append("".join(buf))
+    return [p.strip() for p in parts
+            if p.strip() and not p.strip().upper().startswith("PRAGMA")]
+
+
+_PG_LOCK = threading.Lock()
+_PG_IDLE: list = []
+PG_POOL_SIZE = int(os.getenv("PG_POOL_SIZE", "4"))
+
+
+class PgCursor:
+    def __init__(self, cur):
+        self._cur = cur
+
+    def _cols(self) -> list[str]:
+        return [d.name for d in (self._cur.description or [])]
+
+    def fetchone(self):
+        row = self._cur.fetchone()
+        return None if row is None else DbRow(self._cols(), row)
+
+    def fetchall(self):
+        cols = self._cols()
+        return [DbRow(cols, r) for r in self._cur.fetchall()]
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+def _pg_new():
+    dsn = DATABASE_URL
+    if "sslmode=" not in dsn:
+        dsn += ("&" if "?" in dsn else "?") + "sslmode=require"
+    # prepare_threshold=None — совместимость с pgbouncer (Supabase pooler)
+    return psycopg.connect(dsn, prepare_threshold=None,
+                           connect_timeout=int(os.getenv("PG_CONNECT_TIMEOUT", "15")))
+
+
+def _pg_checkout():
+    with _PG_LOCK:
+        if _PG_IDLE:
+            return _PG_IDLE.pop()
+    return _pg_new()
+
+
+def _pg_checkin(conn) -> None:
+    try:
+        if conn.closed or conn.broken:
+            conn.close()
+            return
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return
+    with _PG_LOCK:
+        if len(_PG_IDLE) < PG_POOL_SIZE:
+            _PG_IDLE.append(conn)
+            return
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+class PgConn:
+    """Адаптер с интерфейсом sqlite3.Connection поверх пула соединений.
+
+    Соединение с Supabase/pooler стоит 2–3 секунды, поэтому одноразовые
+    коннекты убивают отзывчивость: держим пул и переиспользуем.
+    """
+
+    def __init__(self):
+        self._c = _pg_checkout()
+        self.row_factory = None
+        self._done = False
+
+    def execute(self, sql: str, params=()):
+        try:
+            return PgCursor(self._c.execute(_sql_fix(sql), params or None))
+        except (psycopg.OperationalError, psycopg.InterfaceError):
+            # пулер закрыл соединение (таймаут/keepalive) — берём новое и повторяем
+            self._c = _pg_new()
+            return PgCursor(self._c.execute(_sql_fix(sql), params or None))
+
+    def executescript(self, script: str) -> None:
+        for stmt in _split_sql(script):
+            self._c.execute(_sql_fix(stmt))
+
+    def commit(self) -> None:
+        self._c.commit()
+
+    def rollback(self) -> None:
+        self._c.rollback()
+
+    def close(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        _pg_checkin(self._c)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type:
+                self._c.rollback()
+            else:
+                self._c.commit()
+        except Exception:
+            try:
+                self._c.close()
+            except Exception:
+                pass
+            self._done = True
+            return False
+        self.close()
+        return False
+
+
+def connect_db():
+    if PG_MODE:
+        return PgConn()
+    return sqlite3.connect(DB_FILE)
+
+
+def table_cols(c, table: str) -> set[str]:
+    if PG_MODE:
+        rows = c.execute("SELECT column_name FROM information_schema.columns "
+                         "WHERE table_schema='public' AND table_name=?", (table,)).fetchall()
+        return {r[0] for r in rows}
+    return {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  DATABASE
 # ══════════════════════════════════════════════════════════════════════
 
 def init_db() -> None:
-    with sqlite3.connect(DB_FILE) as c:
+    with connect_db() as c:
         c.executescript("""
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
@@ -254,10 +460,10 @@ def init_db() -> None:
             message TEXT NOT NULL
         );
         """)
-        _cols = {r[1] for r in c.execute("PRAGMA table_info(api_keys)")}
+        _cols = table_cols(c, "api_keys")
         if "upstream_key" not in _cols:
             c.execute("ALTER TABLE api_keys ADD COLUMN upstream_key TEXT DEFAULT ''")
-        _mcols = {r[1] for r in c.execute("PRAGMA table_info(mappings)")}
+        _mcols = table_cols(c, "mappings")
         if "system_prompt" not in _mcols:
             c.execute("ALTER TABLE mappings ADD COLUMN system_prompt TEXT DEFAULT ''")
         if "system_repeat_tokens" not in _mcols:
@@ -270,21 +476,21 @@ def init_db() -> None:
             c.execute("ALTER TABLE api_keys ADD COLUMN rank INTEGER DEFAULT 3")
         if "tg_id" not in _cols:
             c.execute("ALTER TABLE api_keys ADD COLUMN tg_id INTEGER DEFAULT 0")
-        _ucols = {r[1] for r in c.execute("PRAGMA table_info(key_usage)")}
+        _ucols = table_cols(c, "key_usage")
         if "billed_tokens" not in _ucols:
             c.execute("ALTER TABLE key_usage ADD COLUMN billed_tokens INTEGER DEFAULT 0")
         if "hidden_tokens" not in _ucols:
             c.execute("ALTER TABLE key_usage ADD COLUMN hidden_tokens INTEGER DEFAULT 0")
         c.commit()
     try:
-        with sqlite3.connect(DB_FILE) as c:
+        with connect_db() as c:
             c.execute("ALTER TABLE api_keys ADD COLUMN key_format TEXT DEFAULT 'noe'")
-    except sqlite3.OperationalError:
+    except DB_ERRORS:
         pass
     # Ключи, выданные до появления колонки, получили формат по умолчанию. Угадываем
     # настоящий по префиксу — иначе антроповский ключ подписан как «noe».
     try:
-        with sqlite3.connect(DB_FILE) as c:
+        with connect_db() as c:
             rows = c.execute("SELECT id, public_key FROM api_keys "
                              "WHERE key_format IS NULL OR key_format='noe'").fetchall()
             fixed = 0
@@ -298,7 +504,7 @@ def init_db() -> None:
                 log.info("key_format: восстановлен у %d ключей", fixed)
     except Exception as e:
         log.warning("key_format backfill: %s", e)
-        _m = {r[1] for r in c.execute("PRAGMA table_info(mappings)")}
+        _m = table_cols(c, "mappings")
         if "is_vision" not in _m:
             c.execute("ALTER TABLE mappings ADD COLUMN is_vision INTEGER DEFAULT 1")
         if "stream_throttle" not in _m:
@@ -314,7 +520,7 @@ KEYS_BY_ID: dict[int, dict] = {}
 
 def load_data() -> None:
     global UPSTREAMS, MAPPINGS, API_KEYS, KEYS_BY_ID, ERROR_RULES
-    with sqlite3.connect(DB_FILE) as c:
+    with connect_db() as c:
         c.row_factory = sqlite3.Row
         UPSTREAMS = {r["id"]: dict(r) for r in c.execute("SELECT * FROM upstreams")}
         MAPPINGS = {}
@@ -457,18 +663,18 @@ async def flush_usage() -> None:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     def _w() -> None:
-        with sqlite3.connect(DB_FILE) as c:
+        with connect_db() as c:
             for kid, d in batch.items():
                 c.execute("""
                     INSERT INTO key_usage (key_id, requests, input_tokens, output_tokens,
                                            billed_tokens, hidden_tokens, last_used)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(key_id) DO UPDATE SET
-                        requests      = requests + excluded.requests,
-                        input_tokens  = input_tokens + excluded.input_tokens,
-                        output_tokens = output_tokens + excluded.output_tokens,
-                        billed_tokens = billed_tokens + excluded.billed_tokens,
-                        hidden_tokens = hidden_tokens + excluded.hidden_tokens,
+                        requests      = key_usage.requests + excluded.requests,
+                        input_tokens  = key_usage.input_tokens + excluded.input_tokens,
+                        output_tokens = key_usage.output_tokens + excluded.output_tokens,
+                        billed_tokens = key_usage.billed_tokens + excluded.billed_tokens,
+                        hidden_tokens = key_usage.hidden_tokens + excluded.hidden_tokens,
                         last_used     = excluded.last_used
                 """, (kid, d["r"], d["i"], d["o"], d.get("b", 0), d.get("h", 0), stamp))
             c.commit()
@@ -2963,6 +3169,9 @@ async def lifespan(app: FastAPI):
     contenter = asyncio.create_task(content_loop())
     log.info("noesphere up | upstreams=%d | models=%d | keys=%d | fp=%s",
              len(UPSTREAMS), len(MAPPINGS), len(API_KEYS), SYSTEM_FINGERPRINT)
+    _unlim = [k for k in API_KEYS.values() if not int(k.get("token_limit") or 0)]
+    if _unlim:
+        log.warning("безлимитных ключей: %d (token_limit=0) — проверь админку", len(_unlim))
     try:
         yield
     finally:
@@ -6818,7 +7027,7 @@ def _svg(name: str) -> str:
 
 
 def render_dashboard(key: str) -> str:
-    with sqlite3.connect(DB_FILE) as c:
+    with connect_db() as c:
         c.row_factory = sqlite3.Row
         ups = [dict(r) for r in c.execute("SELECT * FROM upstreams ORDER BY id")]
         maps = [dict(r) for r in c.execute("SELECT * FROM mappings ORDER BY id")]
@@ -7054,7 +7263,7 @@ def render_dashboard(key: str) -> str:
         <input name="note" placeholder="Name (client name)" required>
         <input name="rpm_limit" type="number" value="60" min="1" placeholder="RPM limit">
         <input name="token_limit" type="number" value="0" min="0"
-               placeholder="Token limit (0 = unlimited, счёт ×2.5)">
+               placeholder="Token limit (пусто/0 = без лимита, счёт ×2.5)">
         <label style="display:flex;align-items:center;gap:6px;white-space:nowrap">
           <input type="checkbox" name="log_content" value="1"
                  style="width:auto;margin:0"> собирать переписку
@@ -7175,11 +7384,19 @@ async def up_add(name: str = Form(...), url: str = Form(...),
                  key: str = Depends(verify_admin)):
     norm_url = normalize_upstream_url(url)
     def _w() -> None:
-        with sqlite3.connect(DB_FILE) as c:
-            c.execute("""INSERT OR REPLACE INTO upstreams
-                         (name,url,api_key,enabled,created_at) VALUES (?,?,?,1,?)""",
-                      (name.strip(), norm_url, "",
-                       datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")))
+        with connect_db() as c:
+            if PG_MODE:
+                c.execute("""INSERT INTO upstreams (name,url,api_key,enabled,created_at)
+                             VALUES (?,?,?,1,?)
+                             ON CONFLICT (name) DO UPDATE SET
+                               url=EXCLUDED.url, api_key=EXCLUDED.api_key, enabled=1""",
+                          (name.strip(), norm_url, "",
+                           datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")))
+            else:
+                c.execute("""INSERT OR REPLACE INTO upstreams
+                             (name,url,api_key,enabled,created_at) VALUES (?,?,?,1,?)""",
+                          (name.strip(), norm_url, "",
+                           datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")))
             c.commit()
     await asyncio.to_thread(_w)
     load_data()
@@ -7189,7 +7406,7 @@ async def up_add(name: str = Form(...), url: str = Form(...),
 @app.post("/admin/upstreams/toggle")
 async def up_toggle(id: int = Form(...), key: str = Depends(verify_admin)):
     def _w() -> None:
-        with sqlite3.connect(DB_FILE) as c:
+        with connect_db() as c:
             c.execute("UPDATE upstreams SET enabled = 1 - enabled WHERE id=?", (id,))
             c.commit()
     await asyncio.to_thread(_w)
@@ -7200,7 +7417,7 @@ async def up_toggle(id: int = Form(...), key: str = Depends(verify_admin)):
 @app.post("/admin/upstreams/delete")
 async def up_del(id: int = Form(...), key: str = Depends(verify_admin)):
     def _w() -> None:
-        with sqlite3.connect(DB_FILE) as c:
+        with connect_db() as c:
             c.execute("DELETE FROM upstreams WHERE id=?", (id,))
             c.execute("DELETE FROM mappings WHERE upstream_id=?", (id,))
             c.commit()
@@ -7221,7 +7438,7 @@ async def map_save(row_id: str = Form(""), fake_model: str = Form(...),
     prompt = (system_prompt or "").strip()
     repeat = max(0, int(system_repeat_tokens))
     def _w() -> None:
-        with sqlite3.connect(DB_FILE) as c:
+        with connect_db() as c:
             if row_id and row_id.isdigit():
                 c.execute("""UPDATE mappings SET
                     fake_model=?, real_model=?, upstream_id=?, owned_by=?,
@@ -7232,14 +7449,32 @@ async def map_save(row_id: str = Form(""), fake_model: str = Form(...),
                      int(context_length), float(delay_sec), int(is_reasoning),
                      int(endpoint_mode), prompt, repeat, int(row_id)))
             else:
-                c.execute("""INSERT OR REPLACE INTO mappings
-                    (fake_model, real_model, upstream_id, owned_by, context_length,
-                     delay_sec, is_reasoning, endpoint_mode, system_prompt,
-                     system_repeat_tokens, enabled)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,1)""",
-                    (fake_model.strip(), real_model.strip(), upstream_id, owned_by.strip(),
-                     int(context_length), float(delay_sec), int(is_reasoning),
-                     int(endpoint_mode), prompt, repeat))
+                if PG_MODE:
+                    c.execute("""INSERT INTO mappings
+                        (fake_model, real_model, upstream_id, owned_by, context_length,
+                         delay_sec, is_reasoning, endpoint_mode, system_prompt,
+                         system_repeat_tokens, enabled)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,1)
+                        ON CONFLICT (fake_model) DO UPDATE SET
+                          real_model=EXCLUDED.real_model, upstream_id=EXCLUDED.upstream_id,
+                          owned_by=EXCLUDED.owned_by, context_length=EXCLUDED.context_length,
+                          delay_sec=EXCLUDED.delay_sec, is_reasoning=EXCLUDED.is_reasoning,
+                          endpoint_mode=EXCLUDED.endpoint_mode,
+                          system_prompt=EXCLUDED.system_prompt,
+                          system_repeat_tokens=EXCLUDED.system_repeat_tokens,
+                          enabled=1""",
+                        (fake_model.strip(), real_model.strip(), upstream_id, owned_by.strip(),
+                         int(context_length), float(delay_sec), int(is_reasoning),
+                         int(endpoint_mode), prompt, repeat))
+                else:
+                    c.execute("""INSERT OR REPLACE INTO mappings
+                        (fake_model, real_model, upstream_id, owned_by, context_length,
+                         delay_sec, is_reasoning, endpoint_mode, system_prompt,
+                         system_repeat_tokens, enabled)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,1)""",
+                        (fake_model.strip(), real_model.strip(), upstream_id, owned_by.strip(),
+                         int(context_length), float(delay_sec), int(is_reasoning),
+                         int(endpoint_mode), prompt, repeat))
             c.commit()
     await asyncio.to_thread(_w)
     load_data()
@@ -7249,7 +7484,7 @@ async def map_save(row_id: str = Form(""), fake_model: str = Form(...),
 @app.post("/admin/mappings/toggle")
 async def map_toggle(id: int = Form(...), key: str = Depends(verify_admin)):
     def _w() -> None:
-        with sqlite3.connect(DB_FILE) as c:
+        with connect_db() as c:
             c.execute("UPDATE mappings SET enabled = 1 - enabled WHERE id=?", (id,))
             c.commit()
     await asyncio.to_thread(_w)
@@ -7260,7 +7495,7 @@ async def map_toggle(id: int = Form(...), key: str = Depends(verify_admin)):
 @app.post("/admin/mappings/delete")
 async def map_del(id: int = Form(...), key: str = Depends(verify_admin)):
     def _w() -> None:
-        with sqlite3.connect(DB_FILE) as c:
+        with connect_db() as c:
             c.execute("DELETE FROM mappings WHERE id=?", (id,))
             c.commit()
     await asyncio.to_thread(_w)
@@ -7271,13 +7506,13 @@ async def map_del(id: int = Form(...), key: str = Depends(verify_admin)):
 @app.post("/admin/keys/add")
 async def k_add(note: str = Form(""), rpm_limit: int = Form(60),
                 upstream_key: str = Form(""), key_format: str = Form("noe"),
-                token_limit: int = Form(0), log_content: str = Form(""),
+                token_limit: int = Form(DEFAULT_KEY_TOKENS), log_content: str = Form(""),
                 key: str = Depends(verify_admin)):
     new_k = gen_key(key_format)
     created = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     def _w() -> None:
-        with sqlite3.connect(DB_FILE) as c:
+        with connect_db() as c:
             c.execute("""INSERT INTO api_keys
                          (public_key, note, rpm_limit, enabled, created_at, upstream_key,
                           key_format, token_limit, log_content)
@@ -7303,7 +7538,7 @@ async def k_add(note: str = Form(""), rpm_limit: int = Form(60),
 @app.post("/admin/keys/content")
 async def k_content(id: int = Form(...), key: str = Depends(verify_admin)):
     def _w() -> None:
-        with sqlite3.connect(DB_FILE) as c:
+        with connect_db() as c:
             c.execute("UPDATE api_keys SET log_content = 1 - log_content WHERE id=?", (id,))
             c.commit()
     await asyncio.to_thread(_w)
@@ -7316,7 +7551,7 @@ async def k_limit(id: int = Form(...), token_limit: int = Form(0),
                  key: str = Depends(verify_admin)):
     limit = max(0, int(token_limit))
     def _w() -> None:
-        with sqlite3.connect(DB_FILE) as c:
+        with connect_db() as c:
             c.execute("UPDATE api_keys SET token_limit=? WHERE id=?", (limit, id))
             c.commit()
     await asyncio.to_thread(_w)
@@ -7327,7 +7562,7 @@ async def k_limit(id: int = Form(...), token_limit: int = Form(0),
 @app.post("/admin/keys/toggle")
 async def k_toggle(id: int = Form(...), key: str = Depends(verify_admin)):
     def _w() -> None:
-        with sqlite3.connect(DB_FILE) as c:
+        with connect_db() as c:
             c.execute("UPDATE api_keys SET enabled = 1 - enabled WHERE id=?", (id,))
             c.commit()
     await asyncio.to_thread(_w)
@@ -7338,7 +7573,7 @@ async def k_toggle(id: int = Form(...), key: str = Depends(verify_admin)):
 @app.post("/admin/keys/delete")
 async def k_del(id: int = Form(...), key: str = Depends(verify_admin)):
     def _w() -> None:
-        with sqlite3.connect(DB_FILE) as c:
+        with connect_db() as c:
             c.execute("DELETE FROM api_keys WHERE id=?", (id,))
             c.execute("DELETE FROM key_usage WHERE key_id=?", (id,))
             c.commit()
