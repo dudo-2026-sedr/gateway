@@ -54,7 +54,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_TG_ID", "5480751648"))
 
 DB_FILE = os.getenv("DB_FILE", "/data/noesphere.db" if os.path.exists("/data") else "noesphere.db")
-PROXY_BASE = os.getenv("PROXY_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+PROXY_BASE = os.getenv("PROXY_BASE_URL", "https://api.funtro.cyou").rstrip("/")
 PROXY_ADMIN_KEY = os.getenv("PROXY_ADMIN_KEY", "dudo_2026").strip()
 
 START_TOKENS = int(os.getenv("START_TOKENS", "500000"))
@@ -81,10 +81,10 @@ PROBE_TTL = float(os.getenv("PROBE_TTL", "60"))
 TICK_SEC = float(os.getenv("TICK_SEC", "60"))
 # Обязательная подписка. ID могут быть числами (-100...) или @username; бот
 # должен быть админом в канале и в чате, иначе статус участника не проверить.
-REQUIRED_CHANNEL_ID = os.getenv("REQUIRED_CHANNEL_ID", "").strip()
-REQUIRED_CHAT_ID = os.getenv("REQUIRED_CHAT_ID", "").strip()
-CHANNEL_URL = os.getenv("CHANNEL_URL", "").strip()
-CHAT_URL = os.getenv("CHAT_URL", "").strip()
+REQUIRED_CHANNEL_ID = os.getenv("REQUIRED_CHANNEL_ID", "-1004294464731").strip()
+REQUIRED_CHAT_ID = os.getenv("REQUIRED_CHAT_ID", "-1003959021367").strip()
+CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/anthropc_claude").strip()
+CHAT_URL = os.getenv("CHAT_URL", "https://t.me/+b2t10tfRDGEyMGY0").strip()
 SUB_CACHE_TTL = float(os.getenv("SUB_CACHE_TTL", "20"))
 SUB_CHECK_EVERY = float(os.getenv("SUB_CHECK_EVERY", "600"))
 REF_CONFIRM_REQUESTS = int(os.getenv("REF_CONFIRM_REQUESTS", "5"))
