@@ -228,7 +228,9 @@ def init_db() -> None:
             upstream_key TEXT DEFAULT '',
             key_format  TEXT DEFAULT 'noe',
             token_limit INTEGER DEFAULT 0,
-            log_content INTEGER DEFAULT 0
+            log_content INTEGER DEFAULT 0,
+            rank        INTEGER DEFAULT 3,
+            tg_id       INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS key_usage (
@@ -264,6 +266,10 @@ def init_db() -> None:
             c.execute("ALTER TABLE api_keys ADD COLUMN token_limit INTEGER DEFAULT 0")
         if "log_content" not in _cols:
             c.execute("ALTER TABLE api_keys ADD COLUMN log_content INTEGER DEFAULT 0")
+        if "rank" not in _cols:
+            c.execute("ALTER TABLE api_keys ADD COLUMN rank INTEGER DEFAULT 3")
+        if "tg_id" not in _cols:
+            c.execute("ALTER TABLE api_keys ADD COLUMN tg_id INTEGER DEFAULT 0")
         _ucols = {r[1] for r in c.execute("PRAGMA table_info(key_usage)")}
         if "billed_tokens" not in _ucols:
             c.execute("ALTER TABLE key_usage ADD COLUMN billed_tokens INTEGER DEFAULT 0")
@@ -324,11 +330,15 @@ def load_data() -> None:
         except Exception:
             ERROR_RULES = []
         # Расход с множителем не должен просесть из-за того, что база отстала
-        # от памяти (буфер сбрасывается раз в 30 с).
+        # от памяти (буфер сбрасывается раз в 30 с) — поднимаем, но учитываем
+        # ежедневный сброс: ноль в базе при ненулевом счётчике — это новый день.
         try:
             for r in c.execute("SELECT key_id, billed_tokens FROM key_usage"):
                 kid, val = int(r["key_id"]), int(r["billed_tokens"] or 0)
-                if val > KEY_BILLED.get(kid, 0):
+                cur = KEY_BILLED.get(kid, 0)
+                if val == 0 and cur > 0:
+                    KEY_BILLED[kid] = 0
+                elif val > cur:
                     KEY_BILLED[kid] = val
         except Exception:
             pass
@@ -371,6 +381,38 @@ def billed_tokens(in_tok: int = 0, out_tok: int = 0) -> int:
         return 0
     mult = TOKEN_MULTIPLIER if TOKEN_MULTIPLIER > 0 else 1.0
     return int(math.ceil(raw * mult))
+
+
+# ── доступ по рангу ключа ───────────────────────────────────────────
+# Ранг 0 — ключ выдан, но чек-ин не взят: модели закрыты.
+# 1 — Новичок, 2 — Профи, 3 — Легенда (все модели).
+RANK_NAMES = {0: "Novice (not activated)", 1: "Novice", 2: "Pro", 3: "Legend"}
+_DEFAULT_RANK_MODELS = {
+    1: {"claude-sonnet-5-5"},
+    2: {"claude-sonnet-5-5", "claude-opus-5"},
+}
+
+try:
+    _override = json.loads(os.getenv("RANK_MODELS", "") or "{}")
+    _RANK_MODELS = {int(k): set(v) for k, v in _override.items()} if _override else _DEFAULT_RANK_MODELS
+except Exception:
+    _RANK_MODELS = _DEFAULT_RANK_MODELS
+
+
+def rank_models(rank: int) -> Optional[set]:
+    """Модели, разрешённые на ранге. None — ограничений нет."""
+    if rank >= 3:
+        return None
+    return _RANK_MODELS.get(rank, set())
+
+
+def model_allowed(key_rec: dict, fake_model: str) -> bool:
+    try:
+        rank = int(key_rec.get("rank") or 0)
+    except (TypeError, ValueError):
+        rank = 0
+    allowed = rank_models(rank)
+    return allowed is None or fake_model in allowed
 
 
 def token_quota_state(key_rec: dict) -> tuple[bool, int, int]:
@@ -3104,6 +3146,12 @@ async def openai_chat(req: Request):
         return err_oai("not_found_error",
                        f"Model {fake_model} not available on this endpoint.",
                        404, req_id, fake_model)
+    if not model_allowed(key_rec, fake_model):
+        _rk = int(key_rec.get("rank") or 0)
+        return err_oai("permission_error",
+                       f"Model {fake_model} is not available on your rank "
+                       f"({RANK_NAMES.get(_rk, _rk)}). Unlock it to use this model.",
+                       403, req_id, fake_model)
 
     upstream = UPSTREAMS.get(mapping["upstream_id"])
     if not upstream or not upstream.get("enabled"):
@@ -4090,6 +4138,12 @@ async def anth_messages(req: Request):
         return err_ant("not_found_error",
                        f"model: {fake_model} not available on this endpoint.",
                        404, req_id, fake_model)
+    if not model_allowed(key_rec, fake_model):
+        _rk = int(key_rec.get("rank") or 0)
+        return err_ant("permission_error",
+                       f"Model {fake_model} is not available on your rank "
+                       f"({RANK_NAMES.get(_rk, _rk)}). Unlock it to use this model.",
+                       403, req_id, fake_model)
 
     upstream = UPSTREAMS.get(mapping["upstream_id"])
     if not upstream or not upstream.get("enabled"):
@@ -4535,8 +4589,11 @@ async def anth_messages(req: Request):
 @app.get("/v1/models")
 async def list_models(req: Request):
     req_id = new_id("req")
-    if not resolve_client(req):
+    key_rec = resolve_client(req)
+    if not key_rec:
         return err_oai("authentication_error", "Invalid API key.", 401, req_id)
+    # Клиент видит только те модели, которые открыты его рангом.
+    visible = {fm: m for fm, m in MAPPINGS.items() if model_allowed(key_rec, fm)}
     # Anthropic clients get Anthropic's shape; an anthropic-version header or a bare
     # x-api-key is how they announce themselves.
     looks_anthropic = bool((req.headers.get("anthropic-version") or "").strip()) or (
@@ -4546,7 +4603,7 @@ async def list_models(req: Request):
         items = [{"type": "model", "id": fm,
                   "display_name": _anth_display_name(fm),
                   "created_at": _model_created_at(fm)}
-                 for fm in MAPPINGS]
+                 for fm in visible]
         return JSONResponse({
             "data": items,
             "has_more": False,
@@ -4557,7 +4614,7 @@ async def list_models(req: Request):
         "id": fm, "object": "model",
         "created": _model_created_ts(fm),
         "owned_by": _public_owner(m.get("owned_by"), fm),
-    } for fm, m in MAPPINGS.items()]
+    } for fm, m in visible.items()]
     return JSONResponse({"object": "list", "data": data}, headers=gw_headers(req_id))
 
 
