@@ -795,12 +795,14 @@ async def subscription_state(uid: int, force: bool = False) -> tuple[bool, list[
         if hit and now - hit[0] < SUB_CACHE_TTL:
             return hit[1], ([] if hit[1] else [n for _, n in need])
     missing: list[str] = []
-    for cid, name in need:
-        ok = await chat_member(cid, uid)
+    # Канал и чат проверяются одним запросом каждый — два похода в Telegram
+    # последовательно давали лишний RTT на каждое нажатие кнопки.
+    results = await asyncio.gather(*(chat_member(cid, uid) for cid, _ in need))
+    for (_cid, name), ok in zip(need, results):
         if ok is False:
             missing.append(name)
         elif ok is None:
-            log.warning("getChatMember(%s) не ответил — считаю проверку пройденной", cid)
+            log.warning("getChatMember(%s) не ответил — считаю проверку пройденной", _cid)
     ok = not missing
     _sub_cache[uid] = (now, ok)
     return ok, missing
@@ -900,11 +902,20 @@ def maybe_confirm_refs() -> list[tuple[int, int]]:
 client: Optional[httpx.AsyncClient] = None
 _me: dict = {}
 
+# Обычный вызов Telegram не должен висеть минуту: 5с на коннект и 20с на ответ
+# хватает с запасом, а зависший запрос больше не тормозит остальные.
+TG_TIMEOUT = httpx.Timeout(connect=5.0, read=20.0, write=20.0, pool=5.0)
+# Long-poll: Telegram держит запрос сколько попросим, поэтому read обязан быть больше.
+POLL_TIMEOUT = int(os.getenv("POLL_TIMEOUT", "25"))
+POLL_HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=POLL_TIMEOUT + 15.0,
+                                  write=20.0, pool=5.0)
 
-async def api(method: str, **params: Any) -> Any:
+
+async def api(method: str, _timeout: Optional[httpx.Timeout] = None, **params: Any) -> Any:
     assert client is not None
     try:
-        r = await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=params)
+        r = await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+                              json=params, timeout=_timeout or TG_TIMEOUT)
     except Exception as e:
         log.warning("tg %s failed: %r", method, e)
         return None
@@ -1573,9 +1584,13 @@ async def on_start(tg_id: int, name: str, username: str, payload: str) -> None:
         if referred_by:
             log_event(referred_by, "referral", f"new user {tg_id}")
     refresh_quota(tg_id)
-    await refresh_profile_bonuses(tg_id, force=True)
-    if tg_id != ADMIN_ID:
-        ok_sub, missing = await subscription_state(tg_id, force=True)
+    if tg_id == ADMIN_ID:
+        await refresh_profile_bonuses(tg_id, force=True)
+    else:
+        # Ник/bio и подписка — два независимых похода в Telegram, шлём параллельно
+        _, (ok_sub, missing) = await asyncio.gather(
+            refresh_profile_bonuses(tg_id, force=True),
+            subscription_state(tg_id, force=True))
         apply_subscription(tg_id, ok_sub)
         if not ok_sub:
             text, markup = render_gate(missing)
@@ -2142,12 +2157,12 @@ async def on_callback_rank_choice(data: str) -> None:
 async def tick_loop() -> None:
     while True:
         try:
-            for uid in daily_reset():
+            for uid in await asyncio.to_thread(daily_reset):
                 u = get_user(uid)
                 if u and int(u["rank"] or 0) >= 1:
                     await send(uid, f"🔄 Квота обновлена: <b>{human(daily_amount(u['rank']))}</b>"
                                     f" + чек-ин {human(CHECKIN_TOKENS)} ждёт в меню.")
-            for inviter, uid in maybe_confirm_refs():
+            for inviter, uid in await asyncio.to_thread(maybe_confirm_refs):
                 await send(inviter, f"🎁 Реферал <code>{uid}</code> подтверждён.\n"
                                     f"Начислено <b>+{human(REF_BONUS)}</b> токенов.")
                 sync_rank(inviter)
@@ -2164,35 +2179,72 @@ async def tick_loop() -> None:
         await asyncio.sleep(TICK_SEC)
 
 
+# Обработчики идут параллельно: медленный запрос (рассылка, проверка подписки)
+# больше не задерживает следующие обновления.
+HANDLER_CONCURRENCY = int(os.getenv("HANDLER_CONCURRENCY", "24"))
+_handler_sem = asyncio.Semaphore(HANDLER_CONCURRENCY)
+_tasks: set[asyncio.Task] = set()
+
+
+async def _guarded(coro) -> None:
+    async with _handler_sem:
+        try:
+            await coro
+        except asyncio.CancelledError:
+            raise
+        except Exception:                        # noqa: BLE001
+            log.exception("handler failed")
+
+
+def _spawn(coro) -> None:
+    task = asyncio.create_task(_guarded(coro))
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+
+
+async def _rank_choice(cb: dict) -> None:
+    await answer_cb(cb["id"])
+    await on_callback_rank_choice(cb["data"])
+
+
 async def poll_loop() -> None:
     offset = 0
+    first = True
     while True:
         try:
-            updates = await api("getUpdates", offset=offset, timeout=25,
-                                allowed_updates=["message", "callback_query"])
+            # drop_pending_updates на первом запросе: после рестарта очередь
+            # старых апдейтов не пережёвывается по одному.
+            updates = await api("getUpdates", _timeout=POLL_HTTP_TIMEOUT,
+                                offset=offset, timeout=POLL_TIMEOUT, limit=100,
+                                allowed_updates=["message", "callback_query"],
+                                drop_pending_updates=first)
+            first = False
             for up in updates or []:
                 offset = max(offset, int(up["update_id"]) + 1)
                 if "callback_query" in up:
                     cb = up["callback_query"]
                     if (cb.get("data") or "").startswith("a:set:"):
-                        await answer_cb(cb["id"])
-                        await on_callback_rank_choice(cb["data"])
+                        _spawn(_rank_choice(cb))
                     else:
-                        await on_callback(cb)
+                        _spawn(on_callback(cb))
                 elif "message" in up:
-                    await on_text(up["message"])
+                    _spawn(on_text(up["message"]))
         except asyncio.CancelledError:
             raise
         except Exception as e:                   # noqa: BLE001
             log.warning("poll: %r", e)
-            await asyncio.sleep(3)
+            await asyncio.sleep(1)
 
 
 async def main() -> None:
     global client, _me
     init_db()
-    client = httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=60.0,
-                                                     write=60.0, pool=10.0))
+    client = httpx.AsyncClient(
+        timeout=TG_TIMEOUT,
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=50,
+                            keepalive_expiry=30.0))
+    # Явно снимаем вебхук: при активном вебхуке getUpdates отдаёт 409 и бот молчит.
+    await api("deleteWebhook", drop_pending_updates=True)
     _me = await api("getMe") or {}
     log.info("bot @%s up | db=%s | proxy=%s | admin=%s",
              _me.get("username"), DB_FILE, PROXY_BASE, ADMIN_ID)
