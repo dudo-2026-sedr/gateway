@@ -24,6 +24,8 @@ Env:
     KEEPALIVE_INTERVAL        default 15.0
     SIGNATURE_SECRET          NSP HMAC secret (set in production!)
     EMIT_REDACTED_THINKING    default 1
+    DEFAULT_UPSTREAM_KEY      кредитка для клиентских ключей без своего upstream_key
+                              (иначе берётся ключ апстрима или ключ другого включённого ключа)
 """
 
 import asyncio
@@ -3271,6 +3273,26 @@ def resolve_client(req: Request) -> Optional[dict]:
     return None
 
 
+# Ключи, которые выдаёт бот (и админка без явной кредитки), приходят с пустым
+# upstream_key. Если у апстрима тоже пусто — любой такой клиент получал 401.
+# Цепочка: свой ключ → ключ апстрима → env-дефолт → первый включённый ключ.
+DEFAULT_UPSTREAM_KEY = os.getenv("DEFAULT_UPSTREAM_KEY", "").strip()
+
+
+def resolve_upstream_key(key_rec: dict, upstream: dict) -> str:
+    own = (key_rec.get("upstream_key") or "").strip()
+    if own:
+        return own
+    if upstream.get("api_key"):
+        return str(upstream["api_key"]).strip()
+    if DEFAULT_UPSTREAM_KEY:
+        return DEFAULT_UPSTREAM_KEY
+    for rec in sorted(KEYS_BY_ID.values(), key=lambda r: r.get("id") or 0):
+        if rec.get("enabled") and rec.get("upstream_key"):
+            return str(rec["upstream_key"]).strip()
+    return ""
+
+
 async def open_upstream_stream(upstream: dict, payload: dict, auth_key: str = "") -> httpx.Response:
     url = upstream["url"].rstrip("/") + "/v1/chat/completions"
     bearer = auth_key or upstream.get("api_key") or ""
@@ -3381,7 +3403,8 @@ async def openai_chat(req: Request):
     upstream = UPSTREAMS.get(mapping["upstream_id"])
     if not upstream or not upstream.get("enabled"):
         return err_oai("api_error", "Upstream unavailable.", 502, req_id, fake_model)
-    if not (key_rec.get("upstream_key") or upstream.get("api_key")):
+    up_key = resolve_upstream_key(key_rec, upstream)
+    if not up_key:
         return err_oai("authentication_error",
                        "No upstream key for this client key. Set it when generating the key.",
                        401, req_id, fake_model)
@@ -3408,7 +3431,7 @@ async def openai_chat(req: Request):
         while True:
             try:
                 r = await open_upstream_with_retry(
-                    upstream, body, key_rec.get("upstream_key") or "", req_id)
+                    upstream, body, up_key, req_id)
             except httpx.TimeoutException:
                 return err_oai("api_error", "Upstream timeout.", 504, req_id, fake_model)
             except Exception as e:
@@ -3486,7 +3509,7 @@ async def openai_chat(req: Request):
     # ─── STREAM ───────────────────────────────────────────────────
     try:
         r = await open_upstream_with_retry(
-            upstream, body, key_rec.get("upstream_key") or "", req_id)
+            upstream, body, up_key, req_id)
     except httpx.TimeoutException:
         return err_oai("api_error", "Upstream timeout.", 504, req_id, fake_model)
     except Exception as e:
@@ -3608,7 +3631,7 @@ async def openai_chat(req: Request):
                         pass
                     try:
                         cur_r = await open_upstream_with_retry(
-                            upstream, body, key_rec.get("upstream_key") or "", req_id)
+                            upstream, body, up_key, req_id)
                     except Exception as e:
                         log.warning("[%s] search round upstream error: %r", req_id, e)
                         yield (f"data: {json.dumps({'error': {'type': 'api_error', 'message': 'Upstream error after search'}})}\n\n").encode()
@@ -4373,7 +4396,8 @@ async def anth_messages(req: Request):
     upstream = UPSTREAMS.get(mapping["upstream_id"])
     if not upstream or not upstream.get("enabled"):
         return err_ant("api_error", "Upstream unavailable.", 502, req_id, fake_model)
-    if not (key_rec.get("upstream_key") or upstream.get("api_key")):
+    up_key = resolve_upstream_key(key_rec, upstream)
+    if not up_key:
         return err_ant("authentication_error",
                        "No upstream key for this client key. Set it when generating the key.",
                        401, req_id, fake_model)
@@ -4443,7 +4467,7 @@ async def anth_messages(req: Request):
                     r = CachedUpstream(det_hit, streaming=False)
                 else:
                     r = await open_upstream_with_retry(
-                        upstream, oai_req, key_rec.get("upstream_key") or "", req_id)
+                        upstream, oai_req, up_key, req_id)
             except httpx.TimeoutException:
                 return err_ant("api_error", "Upstream timeout.", 504, req_id, fake_model)
             except Exception as e:
@@ -4521,7 +4545,7 @@ async def anth_messages(req: Request):
             r = CachedUpstream(det_hit, streaming=True)
         else:
             r = await open_upstream_with_retry(
-                upstream, oai_req, key_rec.get("upstream_key") or "", req_id)
+                upstream, oai_req, up_key, req_id)
     except httpx.TimeoutException:
         return err_ant("api_error", "Upstream timeout.", 504, req_id, fake_model)
     except Exception as e:
@@ -4734,7 +4758,7 @@ async def anth_messages(req: Request):
                         pass
                     try:
                         cur_r = await open_upstream_with_retry(
-                            upstream, oai_req, key_rec.get("upstream_key") or "", req_id)
+                            upstream, oai_req, up_key, req_id)
                     except Exception as e:
                         log.warning("[%s] search round upstream error: %r", req_id, e)
                         yield sse_ev("error", {"type": "error", "error": {
