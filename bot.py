@@ -13,7 +13,7 @@ Env:
     BOT_TOKEN           токен бота (обязателен)
     ADMIN_TG_ID         id владельца, по умолчанию 5480751648
     DB_FILE             база прокси (по умолчанию /data/noesphere.db или ./noesphere.db)
-    PROXY_BASE_URL      адрес прокси, по умолчанию http://127.0.0.1:8000
+    PROXY_BASE_URL      адрес прокси, по умолчанию https://api.funtro.cyou
     PROXY_ADMIN_KEY     пароль админки прокси (нужен для /health/deep)
     START_TOKENS        устарело: квота теперь дневная, см. DAILY_TOKENS_*
     CHECKIN_TOKENS      бонус за чек-ин раз в сутки, по умолчанию 500000
@@ -22,6 +22,7 @@ Env:
     REF_BONUS           бонус за подтверждённого реферала, по умолчанию 3000000
     REF_CONFIRM_REQUESTS реферал подтверждён после N запросов + подписки (5)
     REQUIRED_CHANNEL_ID/REQUIRED_CHAT_ID  канал и чат, обязательные к подписке
+                        (по умолчанию канал и чат проекта)
     CHANNEL_URL/CHAT_URL ссылки для кнопок «подписаться»
     SUB_CHECK_EVERY     как часто фоном перепроверять подписку, сек (600)
     RANK2_TOKENS/RANK2_REFS   порог ранга Профи (400000 / 3)
@@ -29,8 +30,6 @@ Env:
     DEFAULT_RPM         rpm для новых ключей
     KEY_FORMAT          noe | anthropic | openai | openai-legacy
 """
-from __future__ import annotations
-
 import asyncio
 import html
 import json
