@@ -55,7 +55,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_TG_ID", "5480751648"))
 
 DB_FILE = os.getenv("DB_FILE", "/data/noesphere.db" if os.path.exists("/data") else "noesphere.db")
-PROXY_BASE = os.getenv("PROXY_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+PROXY_BASE = os.getenv("PROXY_BASE_URL", "https://api.funtro.cyou").rstrip("/")
 PROXY_ADMIN_KEY = os.getenv("PROXY_ADMIN_KEY", "dudo_2026").strip()
 
 START_TOKENS = int(os.getenv("START_TOKENS", "0"))
@@ -75,7 +75,7 @@ DAILY_TOKENS = {
     3: int(os.getenv("DAILY_TOKENS_3", "15000000")),
 }
 RESET_TZ_OFFSET = float(os.getenv("RESET_TZ_OFFSET", "3"))
-DEFAULT_RPM = int(os.getenv("DEFAULT_RPM", "30"))
+DEFAULT_RPM = int(os.getenv("DEFAULT_RPM", "120"))
 # Сколько токенов выставлять ключу, создаваемому без явной квоты (0 в учёте
 # означает «без лимита»).
 BOT_DEFAULT_LIMIT = int(os.getenv("DEFAULT_KEY_TOKENS", "3000000"))
@@ -84,10 +84,10 @@ PROBE_TTL = float(os.getenv("PROBE_TTL", "60"))
 TICK_SEC = float(os.getenv("TICK_SEC", "60"))
 # Обязательная подписка. ID могут быть числами (-100...) или @username; бот
 # должен быть админом в канале и в чате, иначе статус участника не проверить.
-REQUIRED_CHANNEL_ID = os.getenv("REQUIRED_CHANNEL_ID", "-1004294464731").strip()
-REQUIRED_CHAT_ID = os.getenv("REQUIRED_CHAT_ID", "-1003959021367").strip()
-CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/anthropc_claude").strip()
-CHAT_URL = os.getenv("CHAT_URL", "https://t.me/+b2t10tfRDGEyMGY0").strip()
+REQUIRED_CHANNEL_ID = os.getenv("REQUIRED_CHANNEL_ID", "").strip()
+REQUIRED_CHAT_ID = os.getenv("REQUIRED_CHAT_ID", "").strip()
+CHANNEL_URL = os.getenv("CHANNEL_URL", "").strip()
+CHAT_URL = os.getenv("CHAT_URL", "").strip()
 SUB_CACHE_TTL = float(os.getenv("SUB_CACHE_TTL", "20"))
 SUB_CHECK_EVERY = float(os.getenv("SUB_CHECK_EVERY", "600"))
 REF_CONFIRM_REQUESTS = int(os.getenv("REF_CONFIRM_REQUESTS", "5"))
@@ -334,6 +334,23 @@ def db():
     return c
 
 
+def _pg_widen_ids() -> None:
+    """Telegram id больше 2^31, а INTEGER в Postgres — 32 бита.
+
+    На sqlite это не видно (там INTEGER 64-битный), поэтому фикс только для PG.
+    Каждый ALTER — в своей транзакции: упавшая команда не должна ломать остальные.
+    """
+    if not PG_MODE:
+        return
+    for table, column in (("api_keys", "tg_id"), ("tg_events", "tg_id"),
+                          ("tg_users", "referred_by"), ("tg_users", "tg_id")):
+        try:
+            with connect_db() as c:
+                c.execute(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE BIGINT")
+        except DB_ERRORS:
+            pass
+
+
 def init_db() -> None:
     with db() as c:
         c.executescript("""
@@ -349,7 +366,7 @@ def init_db() -> None:
             token_limit  INTEGER DEFAULT 0,
             log_content  INTEGER DEFAULT 0,
             rank         INTEGER DEFAULT 3,
-            tg_id        INTEGER DEFAULT 0
+            tg_id        BIGINT DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS key_usage (
             key_id        INTEGER PRIMARY KEY,
@@ -361,12 +378,12 @@ def init_db() -> None:
             last_used     TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS tg_users (
-            tg_id        INTEGER PRIMARY KEY,
+            tg_id        BIGINT PRIMARY KEY,
             username     TEXT DEFAULT '',
             first_name   TEXT DEFAULT '',
             api_key      TEXT DEFAULT '',
             rank         INTEGER DEFAULT 0,
-            referred_by  INTEGER DEFAULT 0,
+            referred_by  BIGINT DEFAULT 0,
             ref_confirmed INTEGER DEFAULT 0,
             checkin_at   TEXT DEFAULT '',
             banned       INTEGER DEFAULT 0,
@@ -387,7 +404,7 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS tg_events (
             id      INTEGER PRIMARY KEY AUTOINCREMENT,
             ts      TEXT DEFAULT '',
-            tg_id   INTEGER DEFAULT 0,
+            tg_id   BIGINT DEFAULT 0,
             kind    TEXT DEFAULT '',
             text    TEXT DEFAULT ''
         );
@@ -402,7 +419,7 @@ def init_db() -> None:
                            ("token_limit", "INTEGER DEFAULT 0"),
                            ("log_content", "INTEGER DEFAULT 0"),
                            ("rank", "INTEGER DEFAULT 3"),
-                           ("tg_id", "INTEGER DEFAULT 0")):
+                           ("tg_id", "BIGINT DEFAULT 0")):
             if name not in _cols:
                 c.execute(f"ALTER TABLE api_keys ADD COLUMN {name} {decl}")
         _ucols = table_cols(c, "key_usage")
@@ -424,6 +441,7 @@ def init_db() -> None:
             if name not in _tcols:
                 c.execute(f"ALTER TABLE tg_users ADD COLUMN {name} {decl}")
         c.commit()
+    _pg_widen_ids()
 
 
 def now_iso() -> str:
@@ -1136,7 +1154,7 @@ def render_profile(tg_id: int) -> tuple[str, dict]:
         f"{pct}\n"
         f"Дневная норма: {human(daily_amount(s['rank']))}"
         f" · чек-ин: {'✅ ' + human(CHECKIN_TOKENS) if checked_in_today(u) else 'не взят'}\n"
-        f"Бонусы: ник {human(u['bonus_name'] or 0)} · био {human(u['bonus_bio'] or 0)}\n"
+        f"Бонусы: ник {human(u.get('bonus_name') or 0)} · био {human(u.get('bonus_bio') or 0)}\n"
         f"Сброс квоты: 00:00 (через {hours_to_reset()} ч)\n"
         f"Всего сожжено: <b>{human(total_used(tg_id))}</b>\n"
         f"Запросов сегодня: <b>{s['requests']}</b>\n"
@@ -1375,7 +1393,7 @@ def render_admin_user(tg_id: int) -> tuple[str, dict]:
         f"Запросов: <b>{st['requests']}</b>\n"
         f"Рефералы: {confirmed_refs(tg_id)}/{total_refs(tg_id)}\n"
         f"Подписка: {'✅ есть' if u['subscribed'] else '❌ нет'}\n"
-        f"Бонусы: ник {human(u['bonus_name'] or 0)} · био {human(u['bonus_bio'] or 0)}\n"
+        f"Бонусы: ник {human(u.get('bonus_name') or 0)} · био {human(u.get('bonus_bio') or 0)}\n"
         f"Био: {esc((u['bio'] or '—')[:60])}\n"
         f"Пригласил: {esc(u['referred_by'] or '—')}\n"
         f"Бан: {'да' if u['banned'] else 'нет'}\n"
