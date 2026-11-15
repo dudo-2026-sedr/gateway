@@ -1,4 +1,4 @@
-l#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Noesphere Proxy — Noetic Labs
 Single-file OpenAI + Anthropic compatible proxy.
@@ -25,7 +25,6 @@ Env:
     SIGNATURE_SECRET          NSP HMAC secret (set in production!)
     EMIT_REDACTED_THINKING    default 1
 """
-from __future__ import annotations
 
 import asyncio
 import base64
@@ -93,7 +92,7 @@ SPHERE_VERSION = "1.0"
 # Пишем только успешные ответы и только текст из запроса (вложения, картинки и
 # байты PDF отбрасываются). Файл — на ключ, потом уходит в бот и удаляется
 # с диска только после подтверждения отправки.
-TG_BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 CONTENT_DIR = os.getenv("CONTENT_DIR", "/data/content" if os.path.exists("/data") else "content")
 CONTENT_FLUSH_SEC = float(os.getenv("CONTENT_FLUSH_SEC", "15"))
