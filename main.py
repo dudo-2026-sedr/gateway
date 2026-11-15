@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+l#!/usr/bin/env python3
 """
 Noesphere Proxy — Noetic Labs
 Single-file OpenAI + Anthropic compatible proxy.
@@ -93,7 +93,7 @@ SPHERE_VERSION = "1.0"
 # Пишем только успешные ответы и только текст из запроса (вложения, картинки и
 # байты PDF отбрасываются). Файл — на ключ, потом уходит в бот и удаляется
 # с диска только после подтверждения отправки.
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+TG_BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 CONTENT_DIR = os.getenv("CONTENT_DIR", "/data/content" if os.path.exists("/data") else "content")
 CONTENT_FLUSH_SEC = float(os.getenv("CONTENT_FLUSH_SEC", "15"))
@@ -394,6 +394,22 @@ def table_cols(c, table: str) -> set[str]:
 #  DATABASE
 # ══════════════════════════════════════════════════════════════════════
 
+def _widen_pg_ids() -> None:
+    """tg_id больше 2^31: INTEGER в Postgres 32-битный, BIGINT — нет.
+
+    Для sqlite ничего не делаем (там INTEGER и так 64-битный).
+    """
+    if not PG_MODE:
+        return
+    for table, column in (("api_keys", "tg_id"), ("tg_users", "referred_by"),
+                          ("tg_users", "tg_id"), ("tg_events", "tg_id")):
+        try:
+            with connect_db() as c:
+                c.execute(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE BIGINT")
+        except Exception:
+            pass
+
+
 def init_db() -> None:
     with connect_db() as c:
         c.executescript("""
@@ -436,7 +452,7 @@ def init_db() -> None:
             token_limit INTEGER DEFAULT 0,
             log_content INTEGER DEFAULT 0,
             rank        INTEGER DEFAULT 3,
-            tg_id       INTEGER DEFAULT 0
+            tg_id       BIGINT DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS key_usage (
@@ -475,13 +491,14 @@ def init_db() -> None:
         if "rank" not in _cols:
             c.execute("ALTER TABLE api_keys ADD COLUMN rank INTEGER DEFAULT 3")
         if "tg_id" not in _cols:
-            c.execute("ALTER TABLE api_keys ADD COLUMN tg_id INTEGER DEFAULT 0")
+            c.execute("ALTER TABLE api_keys ADD COLUMN tg_id BIGINT DEFAULT 0")
         _ucols = table_cols(c, "key_usage")
         if "billed_tokens" not in _ucols:
             c.execute("ALTER TABLE key_usage ADD COLUMN billed_tokens INTEGER DEFAULT 0")
         if "hidden_tokens" not in _ucols:
             c.execute("ALTER TABLE key_usage ADD COLUMN hidden_tokens INTEGER DEFAULT 0")
         c.commit()
+    _widen_pg_ids()
     try:
         with connect_db() as c:
             c.execute("ALTER TABLE api_keys ADD COLUMN key_format TEXT DEFAULT 'noe'")
