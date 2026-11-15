@@ -24,6 +24,8 @@ Env:
     KEEPALIVE_INTERVAL        default 15.0
     SIGNATURE_SECRET          NSP HMAC secret (set in production!)
     EMIT_REDACTED_THINKING    default 1
+    TOKEN_MULTIPLIER          множитель расхода токенов (по умолчанию 2.5)
+    MIN_BILLED_TOKENS         минимум списания за запрос (по умолчанию 19000)
     DEFAULT_UPSTREAM_KEY      кредитка для клиентских ключей без своего upstream_key
                               (иначе берётся ключ апстрима или ключ другого включённого ключа)
 """
@@ -73,6 +75,8 @@ KEEPALIVE_INTERVAL = float(os.getenv("KEEPALIVE_INTERVAL", "15.0"))
 # Во сколько раз расход токенов ключа считается больше настоящего. 2.5 -> клиент,
 # потративший у апстрима 70k, видит у себя 175k.
 TOKEN_MULTIPLIER = float(os.getenv("TOKEN_MULTIPLIER", "2.5"))
+# Минимум, который списывается за любой запрос (в биллинговых токенах).
+MIN_BILLED_TOKENS = int(os.getenv("MIN_BILLED_TOKENS", "19000"))
 # Лимит по умолчанию для ключей, создаваемых из админки: раньше там стоял 0,
 # а 0 в нашем учёте = «без лимита», из-за чего ключи выходили безлимитными.
 DEFAULT_KEY_TOKENS = int(os.getenv("DEFAULT_KEY_TOKENS", "3000000"))
@@ -604,7 +608,9 @@ def billed_tokens(in_tok: int = 0, out_tok: int = 0) -> int:
     if not raw:
         return 0
     mult = TOKEN_MULTIPLIER if TOKEN_MULTIPLIER > 0 else 1.0
-    return int(math.ceil(raw * mult))
+    # Пол на запрос: короткая переписка не может стоить меньше MIN_BILLED_TOKENS,
+    # поэтому «Кто ты?» + ответ всегда одни и те же ~19к независимо от модели.
+    return max(MIN_BILLED_TOKENS, int(math.ceil(raw * mult)))
 
 
 # ── доступ по рангу ключа ───────────────────────────────────────────
@@ -1980,58 +1986,111 @@ def now_ts() -> int:
     return int(time.time())
 
 
+# ── ТОКЕНИЗАТОР ─────────────────────────────────────────────────────
+# Словарь Claude не опубликован, поэтому считаем по измеренным бюджетам
+# символов на токен токенизатора Opus 4.7+/5.x (замеры на публичных корпусах):
+#   латиница/ASCII     — 3.45 символа на токен (англ. проза 3.25–3.6)
+#   кириллица          — 1.03 символа на токен (почти буква в букву)
+#   CJK и прочие письма — 1 токен на символ (byte-fallback)
+# Считается одинаково для всех моделей: в шлюзе всё — Claude.
+_ASCII_CHARS_PER_TOKEN = 3.45
+_CYR_CHARS_PER_TOKEN = 1.03
+# Служебная обвязка Anthropic: 3 токена на запрос + 6 на сообщение
+_MSG_OVERHEAD = 6
+_REQ_OVERHEAD = 3
+
+
+def _run_tokens(cls: int, n: int) -> float:
+    if cls == 0:
+        return n / _ASCII_CHARS_PER_TOKEN
+    if cls == 1:
+        return n / _CYR_CHARS_PER_TOKEN
+    return float(n)
+
+
+def tokens_raw(text: str) -> float:
+    """Дробный счёт токенов без округления — сумма по кускам остаётся стабильной."""
+    if not text:
+        return 0.0
+    total = 0.0
+    prev = -1
+    run = 0
+    for ch in text:
+        o = ord(ch)
+        cls = 0 if o < 128 else (1 if 0x0400 <= o <= 0x052F else 2)
+        if cls != prev:
+            if run:
+                total += _run_tokens(prev, run)
+            prev, run = cls, 1
+        else:
+            run += 1
+    if run:
+        total += _run_tokens(prev, run)
+    return total
+
+
 def estimate_tokens(text: str) -> int:
     if not text:
         return 0
-    return max(1, (len(text.encode("utf-8")) + 2) // 3)
+    return max(1, int(math.ceil(tokens_raw(text))))
 
 
 _IMG_TOKENS = 85
 _DOC_TOKENS = 1500
 
 
-def _count_part(p: Any) -> int:
+def _count_part_raw(p: Any) -> float:
     if not isinstance(p, dict):
-        return 0
+        return 0.0
     t = p.get("type")
     if t in ("text", "input_text", "output_text"):
-        return estimate_tokens(p.get("text") or "")
+        return tokens_raw(p.get("text") or "")
     if t in ("image_url", "image", "input_image"):
-        return _IMG_TOKENS
+        return float(_IMG_TOKENS)
     if t in ("file", "input_file", "document"):
-        return _DOC_TOKENS
+        return float(_DOC_TOKENS)
     if t == "tool_result":
-        return 4 + _count_content(p.get("content"))
+        return 4 + _count_content_raw(p.get("content"))
     if t == "tool_use":
-        return 8 + estimate_tokens(json.dumps(p.get("input") or {}, ensure_ascii=False))
-    return 0
+        return 8 + tokens_raw(json.dumps(p.get("input") or {}, ensure_ascii=False))
+    return 0.0
+
+
+def _count_content_raw(c: Any) -> float:
+    if isinstance(c, str):
+        return tokens_raw(c)
+    if isinstance(c, list):
+        return sum(_count_part_raw(p) for p in c)
+    return 0.0
+
+
+def _count_part(p: Any) -> int:
+    return int(math.ceil(_count_part_raw(p)))
 
 
 def _count_content(c: Any) -> int:
-    if isinstance(c, str):
-        return estimate_tokens(c)
-    if isinstance(c, list):
-        return sum(_count_part(p) for p in c)
-    return 0
+    return int(math.ceil(_count_content_raw(c)))
 
 
 def estimate_messages_tokens(messages: list) -> int:
-    """Оценка входа. Медиа и base64 считаем фиксированно, чтобы не сканировать мегабайты."""
+    """Вход в токенах. Дроби копятся без округления и округляются один раз в конце.
+
+    Медиа и base64 считаем фиксированно, чтобы не сканировать мегабайты.
+    """
+    total = float(_REQ_OVERHEAD) + _MSG_OVERHEAD
     if not messages:
-        return 8
-    total = 0
+        return int(total)
     for m in messages:
         if not isinstance(m, dict):
             continue
-        total += 6
-        total += _count_content(m.get("content"))
+        total += _MSG_OVERHEAD + _count_content_raw(m.get("content"))
         for tc in (m.get("tool_calls") or []):
             if isinstance(tc, dict):
                 fn = tc.get("function") or {}
                 total += 8
-                total += estimate_tokens(str(fn.get("name") or ""))
-                total += estimate_tokens(str(fn.get("arguments") or ""))
-    return max(total, 6)
+                total += tokens_raw(str(fn.get("name") or ""))
+                total += tokens_raw(str(fn.get("arguments") or ""))
+    return max(1, int(math.ceil(total)))
 
 def extract_key(req: Request) -> Optional[str]:
     h = req.headers
@@ -3669,7 +3728,7 @@ async def openai_chat(req: Request):
                 yield b"data: [DONE]\n\n"
                 await record_content(key_rec, mapping, "/v1/chat/completions", orig_msgs,
                                      "".join(out_text_parts),
-                                     max(0, in_tok - hidden_in), max(0, out_chars // 4), True)
+                                     max(0, in_tok - hidden_in), estimate_tokens("".join(out_text_parts)), True)
                 break
         except asyncio.CancelledError:
             raise
@@ -3685,7 +3744,7 @@ async def openai_chat(req: Request):
                 await cur_r.aclose()
             except Exception:
                 pass
-            await bump_usage(key_rec["id"], in_tok, max(0, out_chars // 4), hidden_in)
+            await bump_usage(key_rec["id"], in_tok, estimate_tokens("".join(out_text_parts)), hidden_in)
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=hdrs)
 
@@ -4801,7 +4860,7 @@ async def anth_messages(req: Request):
 
                 if saw_tool:
                     stop_reason = "tool_use"
-                out_tok = up_out or max(1, out_chars // 4)
+                out_tok = up_out or max(1, estimate_tokens("".join(out_text_parts)))
                 if det_hit is None and det_key and not saw_tool:
                     _det_put(det_key, "".join(out_text_parts))
                 yield sse_ev("message_delta", {
@@ -4827,7 +4886,7 @@ async def anth_messages(req: Request):
                 await cur_r.aclose()
             except Exception:
                 pass
-            await bump_usage(key_rec["id"], in_tok, up_out or max(1, out_chars // 4), hidden_in)
+            await bump_usage(key_rec["id"], in_tok, up_out or max(1, estimate_tokens("".join(out_text_parts))), hidden_in)
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=hdrs)
 
@@ -5463,6 +5522,7 @@ async def admin_chat(request: Request, key: str = Depends(verify_admin)):
         in_tok = estimate_messages_tokens(body["messages"])
         stripper = ThinkStripper()
         out_chars = 0
+        out_parts: list[str] = []
         rounds = 0
         cur_r: Optional[httpx.Response] = None
 
@@ -5544,6 +5604,7 @@ async def admin_chat(request: Request, key: str = Depends(verify_admin)):
                                 if clean:
                                     clean = sanitize_text(clean)
                                     out_chars += len(clean)
+                                    out_parts.append(clean)
                                     yield ev({"t": "text", "text": clean})
                             if ch.get("finish_reason"):
                                 last_finish = str(ch["finish_reason"])
@@ -5605,6 +5666,7 @@ async def admin_chat(request: Request, key: str = Depends(verify_admin)):
                 if tail:
                     tail = sanitize_text(tail)
                     out_chars += len(tail)
+                    out_parts.append(tail)
                     yield ev({"t": "text", "text": tail})
                 if out_chars == 0:
                     yield ev({"t": "error", "message":
@@ -5613,7 +5675,7 @@ async def admin_chat(request: Request, key: str = Depends(verify_admin)):
                               + ". This usually means the model asked for a tool the "
                                 "gateway does not run — try rephrasing or another model."})
                 yield ev({"t": "usage", "in": max(0, in_tok - hidden_ui),
-                          "out": max(0, out_chars // 4)})
+                          "out": max(0, estimate_tokens("".join(out_parts)))})
                 yield ev({"t": "done"})
                 break
 
