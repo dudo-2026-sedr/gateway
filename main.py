@@ -24,8 +24,7 @@ Env:
     KEEPALIVE_INTERVAL        default 15.0
     SIGNATURE_SECRET          NSP HMAC secret (set in production!)
     EMIT_REDACTED_THINKING    default 1
-    TOKEN_MULTIPLIER          множитель расхода токенов (по умолчанию 2.5)
-    MIN_BILLED_TOKENS         минимум списания за запрос (по умолчанию 19000)
+    CLAUDE_TOKENIZER_VERSION  поколение токенизатора Claude для учёта (по умолчанию 4.8)
     DEFAULT_UPSTREAM_KEY      кредитка для клиентских ключей без своего upstream_key
                               (иначе берётся ключ апстрима или ключ другого включённого ключа)
 """
@@ -49,6 +48,7 @@ import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any, AsyncIterator, Optional
 
 import httpx
@@ -72,11 +72,9 @@ DB_FILE = os.getenv("DB_FILE", "/data/noesphere.db" if os.path.exists("/data") e
 PORT = int(os.getenv("PORT", "8000"))
 WORKERS = int(os.getenv("WORKERS", "1"))
 KEEPALIVE_INTERVAL = float(os.getenv("KEEPALIVE_INTERVAL", "15.0"))
-# Во сколько раз расход токенов ключа считается больше настоящего. 2.5 -> клиент,
-# потративший у апстрима 70k, видит у себя 175k.
-TOKEN_MULTIPLIER = float(os.getenv("TOKEN_MULTIPLIER", "2.5"))
-# Минимум, который списывается за любой запрос (в биллинговых токенах).
-MIN_BILLED_TOKENS = int(os.getenv("MIN_BILLED_TOKENS", "19000"))
+# Поколение токенизатора Claude, по которому считается расход: 4.8 — Opus 4.8+ и Opus 5,
+# 4.7 — Opus 4.7, 3.0 — всё, что старше Opus 4.7.
+CLAUDE_TOKENIZER_VERSION = os.getenv("CLAUDE_TOKENIZER_VERSION", "4.8").strip() or "4.8"
 # Лимит по умолчанию для ключей, создаваемых из админки: раньше там стоял 0,
 # а 0 в нашем учёте = «без лимита», из-за чего ключи выходили безлимитными.
 DEFAULT_KEY_TOKENS = int(os.getenv("DEFAULT_KEY_TOKENS", "3000000"))
@@ -557,7 +555,7 @@ def load_data() -> None:
             ERROR_RULES = [dict(r) for r in c.execute("SELECT * FROM error_rules ORDER BY id")]
         except Exception:
             ERROR_RULES = []
-        # Расход с множителем не должен просесть из-за того, что база отстала
+        # Расход в памяти не должен просесть из-за того, что база отстала
         # от памяти (буфер сбрасывается раз в 30 с) — поднимаем, но учитываем
         # ежедневный сброс: ноль в базе при ненулевом счётчике — это новый день.
         try:
@@ -598,19 +596,14 @@ async def check_rate(key_id: int, limit: int) -> tuple[bool, int, int]:
 
 _usage_buf: dict[int, dict] = {}
 _usage_lock = asyncio.Lock()
-# Счётчик с множителем в памяти — по нему решается, не исчерпан ли лимит ключа.
+# Счётчик расхода в памяти — по нему решается, не исчерпан ли лимит ключа.
 # Он же переживает перечитывание базы: load_data только поднимает значение.
 KEY_BILLED: dict[int, int] = {}
 
 
 def billed_tokens(in_tok: int = 0, out_tok: int = 0) -> int:
-    raw = max(0, int(in_tok)) + max(0, int(out_tok))
-    if not raw:
-        return 0
-    mult = TOKEN_MULTIPLIER if TOKEN_MULTIPLIER > 0 else 1.0
-    # Пол на запрос: короткая переписка не может стоить меньше MIN_BILLED_TOKENS,
-    # поэтому «Кто ты?» + ответ всегда одни и те же ~19к независимо от модели.
-    return max(MIN_BILLED_TOKENS, int(math.ceil(raw * mult)))
+    """Списывается ровно столько, сколько насчитал токенизатор."""
+    return max(0, int(in_tok)) + max(0, int(out_tok))
 
 
 # ── доступ по рангу ключа ───────────────────────────────────────────
@@ -1987,12 +1980,28 @@ def now_ts() -> int:
 
 
 # ── ТОКЕНИЗАТОР ─────────────────────────────────────────────────────
-# Словарь Claude не опубликован, поэтому считаем по измеренным бюджетам
-# символов на токен токенизатора Opus 4.7+/5.x (замеры на публичных корпусах):
-#   латиница/ASCII     — 3.45 символа на токен (англ. проза 3.25–3.6)
-#   кириллица          — 1.03 символа на токен (почти буква в букву)
-#   CJK и прочие письма — 1 токен на символ (byte-fallback)
-# Считается одинаково для всех моделей: в шлюзе всё — Claude.
+# Считаем по реконструкции токенизатора Claude (ctok, MIT): словарь Anthropic не
+# публикует, ctok восстановил его замерами count_tokens и раскладывает текст
+# минимально-стоимостной мозаикой. Поколение задаётся CLAUDE_TOKENIZER_VERSION:
+# v4.8 — Opus 4.8+/Opus 5 (словарь v4.7 + рамка из 6 токенов), v4.7 — Opus 4.7,
+# v3.0 — всё до Opus 4.7. Новый токенизатор даёт ~30% больше токенов на том же
+# тексте, чем старый.
+try:
+    from ctok import token_count as _ctok_count
+except Exception as _tok_err:  # без ctok — грубая оценка по символам
+    _ctok_count = None
+    log.warning("ctok unavailable, falling back to char estimates: %r", _tok_err)
+
+# Сколько токенов ctok добавляет на рамку одного сообщения: вычитаем, чтобы
+# получить чистый вес контента.
+_TOKEN_FRAME = 0
+if _ctok_count is not None:
+    try:
+        _TOKEN_FRAME = _ctok_count("", CLAUDE_TOKENIZER_VERSION)
+    except Exception as e:
+        log.warning("ctok version %r unsupported: %r", CLAUDE_TOKENIZER_VERSION, e)
+        _ctok_count = None
+
 _ASCII_CHARS_PER_TOKEN = 3.45
 _CYR_CHARS_PER_TOKEN = 1.03
 # Служебная обвязка Anthropic: 3 токена на запрос + 6 на сообщение
@@ -2000,18 +2009,15 @@ _MSG_OVERHEAD = 6
 _REQ_OVERHEAD = 3
 
 
-def _run_tokens(cls: int, n: int) -> float:
-    if cls == 0:
-        return n / _ASCII_CHARS_PER_TOKEN
-    if cls == 1:
-        return n / _CYR_CHARS_PER_TOKEN
-    return float(n)
+def _char_tokens(text: str) -> float:
+    """Запасной счёт по символам, если ctok недоступен."""
+    def run_tokens(cls: int, n: int) -> float:
+        if cls == 0:
+            return n / _ASCII_CHARS_PER_TOKEN
+        if cls == 1:
+            return n / _CYR_CHARS_PER_TOKEN
+        return float(n)
 
-
-def tokens_raw(text: str) -> float:
-    """Дробный счёт токенов без округления — сумма по кускам остаётся стабильной."""
-    if not text:
-        return 0.0
     total = 0.0
     prev = -1
     run = 0
@@ -2020,13 +2026,27 @@ def tokens_raw(text: str) -> float:
         cls = 0 if o < 128 else (1 if 0x0400 <= o <= 0x052F else 2)
         if cls != prev:
             if run:
-                total += _run_tokens(prev, run)
+                total += run_tokens(prev, run)
             prev, run = cls, 1
         else:
             run += 1
     if run:
-        total += _run_tokens(prev, run)
+        total += run_tokens(prev, run)
     return total
+
+
+@lru_cache(maxsize=2048)
+def _ctok_toks(text: str) -> float:
+    return float(max(0, _ctok_count(text, CLAUDE_TOKENIZER_VERSION) - _TOKEN_FRAME))
+
+
+def tokens_raw(text: str) -> float:
+    """Вес текста в токенах без округления — сумма по кускам остаётся стабильной."""
+    if not text:
+        return 0.0
+    if _ctok_count is not None:
+        return max(1.0, _ctok_toks(text))
+    return _char_tokens(text)
 
 
 def estimate_tokens(text: str) -> int:
@@ -3058,6 +3078,90 @@ def model_system_prompt(mapping: dict) -> str:
     return "\n\n".join(parts)
 
 
+# ── защита системной инструкции от раскрытия ──────────────────────────
+# Одного запрета в промпте мало: если модель всё же начинает цитировать
+# инструкцию, вырезаем это из ответа. Ищем фрагменты (предложения/строки)
+# инструкции в тексте; в стриме держим только подозрительный хвост — текст,
+# который может оказаться началом фрагмента, иначе стрим идёт без задержек.
+_PROMPT_FRAG_MIN = 48
+_PROMPT_ANCHOR = 8
+
+
+@lru_cache(maxsize=16)
+def _prompt_fragments(instruction: str) -> tuple[str, ...]:
+    frags: list[str] = []
+    for line in re.split(r"\n+|(?<=[.!?])\s+", instruction or ""):
+        s = line.strip()
+        if len(s) >= _PROMPT_FRAG_MIN:
+            frags.append(s)
+    return tuple(frags)
+
+
+class PromptLeakGuard:
+    """Не даёт системной инструкции уйти клиенту."""
+
+    def __init__(self, instruction: str):
+        self.frags = _prompt_fragments(instruction)
+        self.pref: dict[str, tuple[str, ...]] = {}
+        for f in self.frags:
+            key = f[:_PROMPT_ANCHOR]
+            self.pref[key] = self.pref.get(key, ()) + (f,)
+        self.maxlen = max((len(f) for f in self.frags), default=0)
+        self.buf = ""
+        self.doubt = False
+        self.blocked = False
+
+    def _probe(self, text: str) -> Optional[tuple[int, bool]]:
+        """(позиция начала утечки, фрагмент уже целиком) или None."""
+        if not self.frags:
+            return None
+        lo = max(0, len(text) - self.maxlen - _PROMPT_ANCHOR)
+        for i in range(lo, len(text) - _PROMPT_ANCHOR + 1):
+            cands = self.pref.get(text[i:i + _PROMPT_ANCHOR])
+            if not cands:
+                continue
+            tail = text[i:]
+            for f in cands:
+                if tail.startswith(f):
+                    return i, True
+                if f.startswith(tail):
+                    return i, False
+        return None
+
+    def feed(self, text: str) -> str:
+        if self.blocked:
+            return ""
+        if not text:
+            return text
+        self.buf += text
+        hit = self._probe(self.buf)
+        if hit is None:
+            # Хвост в якорь не влезает — держим его, чтобы поймать совпадение на стыке.
+            keep = self.buf[-_PROMPT_ANCHOR + 1:]
+            out = self.buf[:-_PROMPT_ANCHOR + 1]
+            self.buf, self.doubt = keep, False
+            return out
+        idx, complete = hit
+        out = self.buf[:idx]
+        if complete:
+            log.warning("prompt leak blocked: response quoted the system instruction")
+            self.blocked = True
+            self.buf, self.doubt = "", False
+        else:
+            self.buf, self.doubt = self.buf[idx:], True
+        return out
+
+    def flush(self) -> str:
+        # Подозрительный хвост не отдаём никогда: если он не дописался до целого
+        # фрагмента, это всё равно начало инструкции.
+        if self.buf and self.doubt:
+            log.warning("prompt leak blocked: response started quoting the system instruction")
+            self.buf = ""
+            return ""
+        out, self.buf = self.buf, ""
+        return out
+
+
 def _system_repeat_interval(mapping: dict) -> int:
     try:
         return int((mapping or {}).get("system_repeat_tokens") or 0)
@@ -3479,6 +3583,7 @@ async def openai_chat(req: Request):
     # Инструкция шлюза считается в расходе ключа, но не видна в usage: разница
     # между оценкой наших сообщений и исходных и есть скрытая часть.
     hidden_in = max(0, in_tok - estimate_messages_tokens(orig_msgs))
+    leak = PromptLeakGuard(model_system_prompt(mapping))
     delay = float(mapping.get("delay_sec") or 0.0)
 
     if delay > 0 and not stream:
@@ -3537,7 +3642,7 @@ async def openai_chat(req: Request):
             raw_content = msg_obj.get("content") or ""
             if raw_content:
                 clean_content, _ = strip_thinking_full(raw_content)
-                msg_obj["content"] = clean_content
+                msg_obj["content"] = leak.feed(clean_content) + leak.flush()
         except Exception:
             pass
 
@@ -3559,7 +3664,7 @@ async def openai_chat(req: Request):
             "completion_tokens": out_tok,
             "total_tokens": max(0, in_tok - hidden_in) + out_tok,
         }
-        await bump_usage(key_rec["id"], in_tok, out_tok, hidden_in)
+        await bump_usage(key_rec["id"], max(0, in_tok - hidden_in), out_tok, hidden_in)
         await record_content(key_rec, mapping, "/v1/chat/completions", orig_msgs,
                              (data.get("choices") or [{}])[0].get("message", {}).get("content") or "",
                              max(0, in_tok - hidden_in), out_tok, False)
@@ -3635,13 +3740,21 @@ async def openai_chat(req: Request):
                         obj = sanitize_openai_body(obj, fake_model,
                                                    fixed_id=fixed_id, created=created)
 
+                        # usage апстрима видит нашу скрытую инструкцию — отдаём свой счёт
+                        if isinstance(obj.get("usage"), dict):
+                            _vis = max(0, in_tok - hidden_in)
+                            _out = estimate_tokens("".join(out_text_parts))
+                            obj["usage"] = {"prompt_tokens": _vis,
+                                            "completion_tokens": _out,
+                                            "total_tokens": _vis + _out}
+
                         # strip thinking
                         try:
                             for ch in obj.get("choices", []):
                                 d = ch.get("delta") or {}
                                 raw = d.get("content")
                                 if isinstance(raw, str) and raw:
-                                    clean = stripper.feed(raw)
+                                    clean = leak.feed(stripper.feed(raw))
                                     if clean:
                                         d["content"] = clean
                                         out_chars += len(clean)
@@ -3707,7 +3820,7 @@ async def openai_chat(req: Request):
                     continue
 
                 # ── финал ──
-                tail_visible = stripper.flush()
+                tail_visible = leak.feed(stripper.flush()) + leak.flush()
                 if tail_visible:
                     tail_obj = {
                         "id": fixed_id, "object": "chat.completion.chunk",
@@ -3744,7 +3857,8 @@ async def openai_chat(req: Request):
                 await cur_r.aclose()
             except Exception:
                 pass
-            await bump_usage(key_rec["id"], in_tok, estimate_tokens("".join(out_text_parts)), hidden_in)
+            await bump_usage(key_rec["id"], max(0, in_tok - hidden_in),
+                             estimate_tokens("".join(out_text_parts)), hidden_in)
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=hdrs)
 
@@ -4510,6 +4624,7 @@ async def anth_messages(req: Request):
     in_tok = estimate_messages_tokens(oai_req["messages"])
     hidden_in = max(0, in_tok - estimate_messages_tokens(orig_msgs))
     visible_in = max(0, in_tok - hidden_in)
+    leak = PromptLeakGuard(model_system_prompt(mapping))
     delay = float(mapping.get("delay_sec") or 0.0)
     thinking_requested = anth_thinking_requested(body)
     det_key = _det_key(mapping["real_model"], oai_req["messages"], body)
@@ -4587,11 +4702,14 @@ async def anth_messages(req: Request):
         try:
             for blk in result.get("content") or []:
                 if isinstance(blk, dict) and blk.get("type") == "text":
-                    blk["text"] = sanitize_text(blk.get("text") or "")
+                    blk["text"] = leak.feed(sanitize_text(blk.get("text") or ""))
+            rest = leak.flush()
+            if rest:
+                result.setdefault("content", []).append({"type": "text", "text": rest})
         except Exception:
             pass
         result = sanitize_anthropic_body(result, fake_model)
-        await bump_usage(key_rec["id"], in_tok, result["usage"]["output_tokens"], hidden_in)
+        await bump_usage(key_rec["id"], visible_in, result["usage"]["output_tokens"], hidden_in)
         _text = "".join(b.get("text", "") for b in (result.get("content") or [])
                         if isinstance(b, dict) and b.get("type") == "text")
         await record_content(key_rec, mapping, "/v1/messages", orig_msgs, _text,
@@ -4784,7 +4902,7 @@ async def anth_messages(req: Request):
                         if isinstance(content, str) and content:
                             visible = stripper.feed(content)
                             if visible:
-                                visible = sanitize_text(visible)
+                                visible = leak.feed(sanitize_text(visible))
                                 for ev in open_text():
                                     yield ev
                                 out_chars += len(visible)
@@ -4841,7 +4959,7 @@ async def anth_messages(req: Request):
                     continue
 
                 # ── финал ──
-                tail = stripper.flush()
+                tail = leak.feed(stripper.flush()) + leak.flush()
                 if tail:
                     tail = sanitize_text(tail)
                     for ev in open_text():
@@ -4886,7 +5004,8 @@ async def anth_messages(req: Request):
                 await cur_r.aclose()
             except Exception:
                 pass
-            await bump_usage(key_rec["id"], in_tok, up_out or max(1, estimate_tokens("".join(out_text_parts))), hidden_in)
+            await bump_usage(key_rec["id"], visible_in,
+                             up_out or max(1, estimate_tokens("".join(out_text_parts))), hidden_in)
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=hdrs)
 
@@ -7223,7 +7342,7 @@ def render_dashboard(key: str) -> str:
                     f'style="margin:4px 0 0;display:flex;gap:4px;align-items:center">'
                     f'<input type="hidden" name="id" value="{k["id"]}">'
                     f'<span class="pill {"off" if over else "on"}" '
-                    f'title="Расход с множителем ×{TOKEN_MULTIPLIER:g}">'
+                    f'title="Расход в токенах токенизатора Claude">'
                     f'{billed//1000}k / {k_limit//1000}k</span>'
                     f'<input name="token_limit" type="number" value="{k_limit}" '
                     f'style="width:86px;padding:2px 6px;font-size:11px">'
