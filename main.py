@@ -421,7 +421,9 @@ def init_db() -> None:
             created_at  TEXT DEFAULT '',
             upstream_key TEXT DEFAULT '',
             key_format  TEXT DEFAULT 'noe',
-
+            token_limit INTEGER DEFAULT 0,
+            rank        INTEGER DEFAULT 3
+        );
 
         CREATE TABLE IF NOT EXISTS key_usage (
             key_id        INTEGER PRIMARY KEY,
@@ -3315,6 +3317,7 @@ async def lifespan(app: FastAPI):
             await reloader
         except asyncio.CancelledError:
             pass
+        await flush_usage()
         if http_client:
             await http_client.aclose()
 
@@ -4624,8 +4627,6 @@ async def anth_messages(req: Request):
             pass
         result = sanitize_anthropic_body(result, fake_model)
         await bump_usage(key_rec["id"], visible_in, result["usage"]["output_tokens"], hidden_in)
-        _text = "".join(b.get("text", "") for b in (result.get("content") or [])
-                        if isinstance(b, dict) and b.get("type") == "text")
         return JSONResponse(result, headers=gw_headers(req_id, model=fake_model))
 
     # ─── STREAM ───────────────────────────────────────────────────
