@@ -91,21 +91,6 @@ SYSTEM_PROMPT_GUARD = os.getenv(
 
 SERVER_HEADER = "noesphere"
 SPHERE_VERSION = "1.0"
-
-# ── сбор контента в Telegram ────────────────────────────────
-# Пишем только успешные ответы и только текст из запроса (вложения, картинки и
-# байты PDF отбрасываются). Файл — на ключ, потом уходит в бот и удаляется
-# с диска только после подтверждения отправки.
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
-CONTENT_DIR = os.getenv("CONTENT_DIR", "/data/content" if os.path.exists("/data") else "content")
-CONTENT_FLUSH_SEC = float(os.getenv("CONTENT_FLUSH_SEC", "15"))
-CONTENT_ROTATE_SEC = float(os.getenv("CONTENT_ROTATE_SEC", "900"))
-CONTENT_MAX_BYTES = int(os.getenv("CONTENT_MAX_BYTES", str(5 * 1024 * 1024)))
-CONTENT_MAX_ROWS = int(os.getenv("CONTENT_MAX_ROWS", "500"))
-CONTENT_SEND_ATTEMPTS = int(os.getenv("CONTENT_SEND_ATTEMPTS", "5"))
-CONTENT_LOG_ENABLED = (os.getenv("CONTENT_LOG_ENABLED", "1") == "1"
-                       and bool(TG_BOT_TOKEN) and bool(TG_CHAT_ID))
 HTTPX_TIMEOUT = httpx.Timeout(
     connect=float(os.getenv("HTTPX_CONNECT_TIMEOUT", "15.0")),
     read=float(os.getenv("HTTPX_READ_TIMEOUT", "1800.0")),   # ждём ответ сколько угодно долго
@@ -397,22 +382,6 @@ def table_cols(c, table: str) -> set[str]:
 #  DATABASE
 # ══════════════════════════════════════════════════════════════════════
 
-def _widen_pg_ids() -> None:
-    """tg_id больше 2^31: INTEGER в Postgres 32-битный, BIGINT — нет.
-
-    Для sqlite ничего не делаем (там INTEGER и так 64-битный).
-    """
-    if not PG_MODE:
-        return
-    for table, column in (("api_keys", "tg_id"), ("tg_users", "referred_by"),
-                          ("tg_users", "tg_id"), ("tg_events", "tg_id")):
-        try:
-            with connect_db() as c:
-                c.execute(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE BIGINT")
-        except Exception:
-            pass
-
-
 def init_db() -> None:
     with connect_db() as c:
         c.executescript("""
@@ -452,11 +421,7 @@ def init_db() -> None:
             created_at  TEXT DEFAULT '',
             upstream_key TEXT DEFAULT '',
             key_format  TEXT DEFAULT 'noe',
-            token_limit INTEGER DEFAULT 0,
-            log_content INTEGER DEFAULT 0,
-            rank        INTEGER DEFAULT 3,
-            tg_id       BIGINT DEFAULT 0
-        );
+
 
         CREATE TABLE IF NOT EXISTS key_usage (
             key_id        INTEGER PRIMARY KEY,
@@ -489,19 +454,14 @@ def init_db() -> None:
             c.execute("ALTER TABLE mappings ADD COLUMN system_repeat_tokens INTEGER DEFAULT 128000")
         if "token_limit" not in _cols:
             c.execute("ALTER TABLE api_keys ADD COLUMN token_limit INTEGER DEFAULT 0")
-        if "log_content" not in _cols:
-            c.execute("ALTER TABLE api_keys ADD COLUMN log_content INTEGER DEFAULT 0")
         if "rank" not in _cols:
             c.execute("ALTER TABLE api_keys ADD COLUMN rank INTEGER DEFAULT 3")
-        if "tg_id" not in _cols:
-            c.execute("ALTER TABLE api_keys ADD COLUMN tg_id BIGINT DEFAULT 0")
         _ucols = table_cols(c, "key_usage")
         if "billed_tokens" not in _ucols:
             c.execute("ALTER TABLE key_usage ADD COLUMN billed_tokens INTEGER DEFAULT 0")
         if "hidden_tokens" not in _ucols:
             c.execute("ALTER TABLE key_usage ADD COLUMN hidden_tokens INTEGER DEFAULT 0")
         c.commit()
-    _widen_pg_ids()
     try:
         with connect_db() as c:
             c.execute("ALTER TABLE api_keys ADD COLUMN key_format TEXT DEFAULT 'noe'")
@@ -706,206 +666,6 @@ async def flush_loop() -> None:
     while True:
         await asyncio.sleep(30)
         await flush_usage()
-
-# ══════════════════════════════════════════════════════════════════════
-#  CONTENT LOG — переписка по ключу -> jsonl -> Telegram -> удаление
-# ══════════════════════════════════════════════════════════════════════
-
-_content_lock = asyncio.Lock()
-_content_buf: dict[int, list[dict]] = {}
-_content_state: dict[int, dict] = {}      # key_id -> {path, bytes, rows, started, touched}
-_content_outbox: list[str] = []
-_content_attempts: dict[str, int] = {}
-
-
-def text_only_messages(msgs: Any) -> list[dict]:
-    """Сообщения без вложений: только роли и текст.
-
-    image/document/file-блоки отбрасываются целиком — в лог идёт только то, что
-    человек написал словами.
-    """
-    out: list[dict] = []
-    if not isinstance(msgs, list):
-        return out
-    for m in msgs:
-        if not isinstance(m, dict):
-            continue
-        role = str(m.get("role") or "user")
-        c = m.get("content")
-        if isinstance(c, str):
-            text = c
-        elif isinstance(c, list):
-            text = "\n".join(str(p.get("text") or "") for p in c
-                              if isinstance(p, dict)
-                              and p.get("type") in ("text", "input_text"))
-        else:
-            text = ""
-        text = text.strip()
-        if text or role == "assistant":
-            out.append({"role": role, "text": text})
-    return out
-
-
-async def record_content(key_rec: dict, mapping: dict, endpoint: str,
-                         messages: Any, response_text: str,
-                         in_vis: int, out_tok: int, stream: bool) -> None:
-    """Положить успешный обмен в буфер ключа."""
-    if not CONTENT_LOG_ENABLED:
-        return
-    if not key_rec or not key_rec.get("log_content"):
-        return
-    try:
-        msgs = text_only_messages(messages)
-        resp = (response_text or "").strip()
-        if not msgs and not resp:
-            return
-        rec = {
-            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "key_id": key_rec.get("id"),
-            "note": key_rec.get("note") or "",
-            "endpoint": endpoint,
-            "model": mapping.get("fake_model") if mapping else "",
-            "stream": bool(stream),
-            "in": int(in_vis),
-            "out": int(out_tok),
-            "messages": msgs,
-            "response": resp,
-        }
-        async with _content_lock:
-            _content_buf.setdefault(int(key_rec["id"]), []).append(rec)
-    except Exception as e:
-        log.warning("content record failed: %r", e)
-
-
-def _content_write(kid: int, rows: list[dict]) -> list[str]:
-    """Дописать строки в файл ключа; вернуть файлы, готовые к отправке."""
-    closed: list[str] = []
-    os.makedirs(CONTENT_DIR, exist_ok=True)
-    now = time.time()
-    st = _content_state.get(kid)
-    if st and (st["bytes"] >= CONTENT_MAX_BYTES or st["rows"] >= CONTENT_MAX_ROWS
-               or now - st["started"] >= CONTENT_ROTATE_SEC):
-        closed.append(st["path"])
-        _content_state.pop(kid, None)
-        st = None
-    if st is None:
-        name = (f"key{kid}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
-                f"_{secrets.token_hex(3)}.jsonl")
-        st = {"path": os.path.join(CONTENT_DIR, name), "bytes": 0, "rows": 0,
-              "started": now, "touched": now}
-        _content_state[kid] = st
-    payload = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
-    data = payload.encode("utf-8")
-    with open(st["path"], "ab") as f:
-        f.write(data)
-    st["bytes"] += len(data)
-    st["rows"] += len(rows)
-    st["touched"] = now
-    return closed
-
-
-async def flush_content() -> None:
-    """Слить буфер на диск и закрыть файлы, у которых вышло время."""
-    if not CONTENT_LOG_ENABLED:
-        return
-    async with _content_lock:
-        batch = {k: v for k, v in _content_buf.items() if v}
-        _content_buf.clear()
-    ready: list[str] = []
-    if batch:
-        try:
-            ready = await asyncio.to_thread(lambda: [p for kid, rows in batch.items()
-                                                     for p in _content_write(kid, rows)])
-        except Exception as e:
-            log.warning("content write failed: %r", e)
-    # файлы, которые заглохли без новых записей
-    now = time.time()
-    for kid, st in list(_content_state.items()):
-        if now - st.get("touched", 0) >= CONTENT_ROTATE_SEC:
-            ready.append(st["path"])
-            _content_state.pop(kid, None)
-    for p in ready:
-        if p not in _content_outbox:
-            _content_outbox.append(p)
-
-
-async def _content_send_one(path: str) -> tuple[bool, str]:
-    if http_client is None:
-        return False, "no http client"
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendDocument"
-    caption = os.path.basename(path)
-    try:
-        with open(path, "rb") as fh:
-            r = await http_client.post(
-                url,
-                data={"chat_id": TG_CHAT_ID, "caption": caption},
-                files={"document": (caption, fh, "application/x-ndjson")},
-                timeout=httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=10.0),
-            )
-    except Exception as e:
-        return False, repr(e)[:200]
-    if r.status_code >= 400:
-        return False, f"HTTP {r.status_code}: {r.text[:200]}"
-    try:
-        ok = bool((r.json() or {}).get("ok"))
-    except Exception:
-        ok = False
-    return (True, "") if ok else (False, r.text[:200])
-
-
-async def send_content_pending() -> None:
-    """Отправить накопившиеся файлы. Удаляем только после подтверждения."""
-    if not CONTENT_LOG_ENABLED or not _content_outbox:
-        return
-    for path in list(_content_outbox):
-        if not os.path.isfile(path):
-            _content_outbox.remove(path)
-            _content_attempts.pop(path, None)
-            continue
-        if os.path.getsize(path) > 45 * 1024 * 1024:
-            log.warning("content file too large for Telegram, kept: %s", path)
-            _content_outbox.remove(path)
-            continue
-        ok, err = await _content_send_one(path)
-        if ok:
-            try:
-                os.remove(path)
-            except OSError as e:
-                log.warning("content delete failed %s: %r", path, e)
-            _content_outbox.remove(path)
-            _content_attempts.pop(path, None)
-            log.info("content sent and deleted: %s", os.path.basename(path))
-            continue
-        n = _content_attempts.get(path, 0) + 1
-        _content_attempts[path] = n
-        log.warning("content send failed (%d/%d) %s: %s", n, CONTENT_SEND_ATTEMPTS,
-                    os.path.basename(path), err)
-        if n >= CONTENT_SEND_ATTEMPTS:
-            failed_dir = os.path.join(CONTENT_DIR, "failed")
-            try:
-                os.makedirs(failed_dir, exist_ok=True)
-                os.replace(path, os.path.join(failed_dir, os.path.basename(path)))
-            except OSError:
-                pass
-            _content_outbox.remove(path)
-            _content_attempts.pop(path, None)
-        break                      # остальные — в следующем проходе
-
-
-async def content_loop() -> None:
-    if not CONTENT_LOG_ENABLED:
-        return
-    os.makedirs(CONTENT_DIR, exist_ok=True)
-    log.info("content log on | dir=%s | rotate=%ss/%sB/%s rows",
-             CONTENT_DIR, int(CONTENT_ROTATE_SEC), CONTENT_MAX_BYTES, CONTENT_MAX_ROWS)
-    while True:
-        await asyncio.sleep(CONTENT_FLUSH_SEC)
-        try:
-            await flush_content()
-            await send_content_pending()
-        except Exception as e:                       # цикл не должен падать
-            log.warning("content loop: %r", e)
-
 
 # ══════════════════════════════════════════════════════════════════════
 #  NSP — Noesphere Signature Protocol
@@ -3537,7 +3297,6 @@ async def lifespan(app: FastAPI):
                                      follow_redirects=False)
     flusher = asyncio.create_task(flush_loop())
     reloader = asyncio.create_task(reload_loop())
-    contenter = asyncio.create_task(content_loop())
     log.info("noesphere up | upstreams=%d | models=%d | keys=%d | fp=%s",
              len(UPSTREAMS), len(MAPPINGS), len(API_KEYS), SYSTEM_FINGERPRINT)
     _unlim = [k for k in API_KEYS.values() if not int(k.get("token_limit") or 0)]
@@ -3548,7 +3307,6 @@ async def lifespan(app: FastAPI):
     finally:
         flusher.cancel()
         reloader.cancel()
-        contenter.cancel()
         try:
             await flusher
         except asyncio.CancelledError:
@@ -3557,12 +3315,6 @@ async def lifespan(app: FastAPI):
             await reloader
         except asyncio.CancelledError:
             pass
-        try:
-            await contenter
-        except asyncio.CancelledError:
-            pass
-        await flush_usage()
-        await flush_content()
         if http_client:
             await http_client.aclose()
 
@@ -3857,9 +3609,6 @@ async def openai_chat(req: Request):
             "total_tokens": max(0, in_tok - hidden_in) + out_tok,
         }
         await bump_usage(key_rec["id"], max(0, in_tok - hidden_in), out_tok, hidden_in)
-        await record_content(key_rec, mapping, "/v1/chat/completions", orig_msgs,
-                             (data.get("choices") or [{}])[0].get("message", {}).get("content") or "",
-                             max(0, in_tok - hidden_in), out_tok, False)
         return JSONResponse(data, headers=gw_headers(req_id, model=fake_model))
 
     # ─── STREAM ───────────────────────────────────────────────────
@@ -4030,9 +3779,6 @@ async def openai_chat(req: Request):
                 if tail.strip():
                     yield (tail + "\n\n").encode()
                 yield b"data: [DONE]\n\n"
-                await record_content(key_rec, mapping, "/v1/chat/completions", orig_msgs,
-                                     "".join(out_text_parts),
-                                     max(0, in_tok - hidden_in), estimate_tokens("".join(out_text_parts)), True)
                 break
         except asyncio.CancelledError:
             raise
@@ -4880,8 +4626,6 @@ async def anth_messages(req: Request):
         await bump_usage(key_rec["id"], visible_in, result["usage"]["output_tokens"], hidden_in)
         _text = "".join(b.get("text", "") for b in (result.get("content") or [])
                         if isinstance(b, dict) and b.get("type") == "text")
-        await record_content(key_rec, mapping, "/v1/messages", orig_msgs, _text,
-                             visible_in, result["usage"]["output_tokens"], False)
         return JSONResponse(result, headers=gw_headers(req_id, model=fake_model))
 
     # ─── STREAM ───────────────────────────────────────────────────
@@ -5155,8 +4899,6 @@ async def anth_messages(req: Request):
                     "usage": {"input_tokens": visible_in, "output_tokens": out_tok},
                 })
                 yield sse_ev("message_stop", {"type": "message_stop"})
-                await record_content(key_rec, mapping, "/v1/messages", orig_msgs,
-                                     "".join(out_text_parts), visible_in, out_tok, True)
                 break
         except asyncio.CancelledError:
             raise
@@ -7551,12 +7293,6 @@ def render_dashboard(key: str) -> str:
                 f'<td><span class="pill {"on" if k["enabled"] else "off"}">'
                 f'{"on" if k["enabled"] else "off"}</span></td>'
                 f'<td><div class="acts">'
-                f'<form method="post" action="/admin/keys/content?key={key}" style="margin:0">'
-                f'<input type="hidden" name="id" value="{k["id"]}">'
-                f'<button class="btn {"primary" if k.get("log_content") else "ghost"}" '
-                f'style="padding:5px 7px;font-size:10.5px" '
-                f'title="Собирать переписку этого ключа в Telegram">'
-                f'{"log:on" if k.get("log_content") else "log:off"}</button></form>'
                 f'<form method="post" action="/admin/keys/toggle?key={key}" style="margin:0">'
                 f'<input type="hidden" name="id" value="{k["id"]}">'
                 f'<button class="btn ghost icon" title="Toggle">{_svg("check")}</button></form>'
@@ -7652,11 +7388,7 @@ def render_dashboard(key: str) -> str:
         <input name="note" placeholder="Name (client name)" required>
         <input name="rpm_limit" type="number" value="60" min="1" placeholder="RPM limit">
         <input name="token_limit" type="number" value="0" min="0"
-               placeholder="Token limit (пусто/0 = без лимита, счёт ×2.5)">
-        <label style="display:flex;align-items:center;gap:6px;white-space:nowrap">
-          <input type="checkbox" name="log_content" value="1"
-                 style="width:auto;margin:0"> собирать переписку
-        </label>
+               placeholder="Token limit (пусто/0 = без лимита)">
         <select name="key_format" title="Формат выдаваемого ключа">
           <option value="noe">sk-noe-v1 — наш формат</option>
           <option value="anthropic">sk-ant-api03 — Anthropic</option>
@@ -7895,7 +7627,7 @@ async def map_del(id: int = Form(...), key: str = Depends(verify_admin)):
 @app.post("/admin/keys/add")
 async def k_add(note: str = Form(""), rpm_limit: int = Form(60),
                 upstream_key: str = Form(""), key_format: str = Form("noe"),
-                token_limit: int = Form(DEFAULT_KEY_TOKENS), log_content: str = Form(""),
+                token_limit: int = Form(DEFAULT_KEY_TOKENS),
                 key: str = Depends(verify_admin)):
     new_k = gen_key(key_format)
     created = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -7904,11 +7636,10 @@ async def k_add(note: str = Form(""), rpm_limit: int = Form(60),
         with connect_db() as c:
             c.execute("""INSERT INTO api_keys
                          (public_key, note, rpm_limit, enabled, created_at, upstream_key,
-                          key_format, token_limit, log_content)
-                         VALUES (?,?,?,1,?,?,?,?,?)""",
+                          key_format, token_limit)
+                         VALUES (?,?,?,1,?,?,?,?)""",
                       (new_k, note.strip(), int(rpm_limit), created, upstream_key.strip(),
-                       (key_format or "noe").strip().lower(), max(0, int(token_limit)),
-                       1 if log_content else 0))
+                       (key_format or "noe").strip().lower(), max(0, int(token_limit))))
             c.commit()
     await asyncio.to_thread(_w)
     load_data()
@@ -7922,17 +7653,6 @@ async def k_add(note: str = Form(""), rpm_limit: int = Form(60),
         f"\\n\\nCopy it now.');"
         f"location.href='/admin?key={key}';</script>"
     )
-
-
-@app.post("/admin/keys/content")
-async def k_content(id: int = Form(...), key: str = Depends(verify_admin)):
-    def _w() -> None:
-        with connect_db() as c:
-            c.execute("UPDATE api_keys SET log_content = 1 - log_content WHERE id=?", (id,))
-            c.commit()
-    await asyncio.to_thread(_w)
-    load_data()
-    return _redir(key)
 
 
 @app.post("/admin/keys/limit")
