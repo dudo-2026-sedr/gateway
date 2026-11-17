@@ -8,7 +8,7 @@ Features:
   - Dark dashboard (Models / Upstreams / API Keys)
   - Streaming-safe keepalive (asyncio.shield — never aborts on big prompts)
   - Full thinking stripper (<think>, <thinking>, <reasoning>)
-  - NSP (Noesphere Signature Protocol) — own HMAC-based signature scheme
+  - Thinking blocks: Claude-shaped signed blocks, prefix-bound, never revealed
   - Whitelist response sanitizer — no upstream identity leak in ANY chunk
   - Per-key sliding-window rate limiter
   - Batched non-blocking usage tracking
@@ -1129,17 +1129,140 @@ def verify_native_signature(sig, expected_body: Optional[bytes] = None) -> bool:
     return hmac.compare_digest(expect, tag)
 
 
-def make_thinking_signature(thinking_text: str) -> str:
-    """Signature for a `thinking` block — native shape."""
-    digest = hashlib.sha256((thinking_text or "").encode("utf-8", "ignore")).digest()
-    return native_signature(digest)
+# --- подпись thinking-блоков в формате Claude ---------------------------
+# Настоящая подпись Anthropic — непрозрачный base64 протобуф-конверта: вложенное
+# сообщение с 32-байтным тегом в поле 5, nonce и блоб на 350–2300 символов.
+# Тег считается по префиксу диалога (system + tools + сообщения до блока), а не
+# по тексту рассуждения: правка thinking-текста подпись не ломает, ломается
+# только изменённый префикс — как preserved thinking у Anthropic.
+_THINKING_BETA = "thinking-binding-controls-2026-08-01"
 
 
-def make_redacted_signature() -> str:
-    return native_signature(b"")
+def _pb_field(num: int, payload: bytes) -> bytes:
+    return bytes([(num << 3) | 2]) + _encode_varint(len(payload)) + payload
 
 
-def thinking_block() -> dict:
+def _pb_parse(raw: bytes) -> Optional[dict]:
+    """{номер поля: payload} для length-delimited протобуфа."""
+    out: dict[int, bytes] = {}
+
+    def read_varint(b, p):
+        val, shift = 0, 0
+        while True:
+            if p >= len(b):
+                return None, p
+            byte = b[p]
+            p += 1
+            val |= (byte & 0x7F) << shift
+            if not byte & 0x80:
+                return val, p
+            shift += 7
+            if shift > 63:
+                return None, p
+
+    pos = 0
+    while pos < len(raw):
+        key, pos = read_varint(raw, pos)
+        if key is None:
+            return None
+        num, wtype = key >> 3, key & 0x07
+        if not num:
+            return None
+        if wtype == 0:                      # varint-поле: значение не храним
+            _val, pos = read_varint(raw, pos)
+            if _val is None:
+                return None
+            continue
+        if wtype != 2:
+            return None
+        ln, pos = read_varint(raw, pos)
+        if ln is None or pos + ln > len(raw):
+            return None
+        out[num] = raw[pos:pos + ln]
+        pos += ln
+    return out
+
+
+def _canon_digest(value) -> bytes:
+    try:
+        blob = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"))
+    except Exception:
+        blob = str(value)
+    return hashlib.sha256(blob.encode("utf-8", "ignore")).digest()
+
+
+def thinking_prefix_chain(system, tools, messages) -> list[bytes]:
+    """Отпечаток префикса перед каждым сообщением; len(messages)+1 элементов."""
+    acc = hashlib.sha256(b"claude-thinking-prefix-v1").digest()
+    acc = hashlib.sha256(acc + _canon_digest(system)).digest()
+    acc = hashlib.sha256(acc + _canon_digest(tools)).digest()
+    out: list[bytes] = [acc]
+    for m in (messages or []):
+        acc = hashlib.sha256(acc + _canon_digest(m)).digest()
+        out.append(acc)
+    return out
+
+
+def make_thinking_signature(thinking_text: str = "",
+                            prefix_digest: Optional[bytes] = None) -> str:
+    """Подпись thinking-блока в форме Claude.
+
+    v2 повторяет устройство настоящей подписи: вложенное protobuf-сообщение с
+    32-байтным тегом в поле 5, nonce и блоб на 400–1900 символов base64. Тег
+    считается по префиксу диалога, а не по тексту рассуждения, — как preserved
+    thinking у Anthropic: правка thinking-текста подпись не ломает, ломает только
+    изменённый префикс. Без prefix_digest работает старый формат (по тексту),
+    чтобы не отваливались подписи, выданные до включения привязки.
+    """
+    if prefix_digest is None:
+        digest = hashlib.sha256((thinking_text or "").encode("utf-8", "ignore")).digest()
+        return native_signature(digest)
+    nonce = secrets.token_bytes(16)
+    blob = secrets.token_bytes(300 + secrets.randbelow(1100))
+    tag = hmac.new(SIGNATURE_SECRET, b"v2" + nonce + blob + prefix_digest,
+                   hashlib.sha256).digest()
+    head = _pb_field(1, b"\x08\x0e\x10\x01\x18\x02" + _pb_field(5, tag))
+    inner = (head + _pb_field(2, nonce) + _pb_field(3, blob)
+             + _pb_field(4, prefix_digest))
+    return base64.b64encode(_pb_field(2, inner)).decode("ascii")
+
+
+def make_redacted_signature(prefix_digest: Optional[bytes] = None) -> str:
+    return make_thinking_signature("", prefix_digest)
+
+
+def verify_thinking_signature(sig) -> tuple[bool, Optional[bytes]]:
+    """(подпись цела, отпечаток префикса). Для старого формата префикс — None."""
+    if not isinstance(sig, str) or not sig:
+        return False, None
+    try:
+        raw = base64.b64decode(sig, validate=False)
+    except Exception:
+        return False, None
+    outer = _pb_parse(raw)
+    if not outer or 2 not in outer:
+        return False, None
+    inner = _pb_parse(outer[2])
+    if not inner:
+        return False, None
+    nonce, blob = inner.get(2), inner.get(3)
+    digest, head = inner.get(4), inner.get(1)
+    if nonce and blob and digest and head and len(digest) == 32:
+        tag = (_pb_parse(head) or {}).get(5)
+        if tag and len(tag) == 32:
+            expect = hmac.new(SIGNATURE_SECRET, b"v2" + nonce + blob + digest,
+                              hashlib.sha256).digest()
+            return hmac.compare_digest(expect, tag), digest
+    version, l_nonce, l_blob, l_tag = parse_native_signature(sig)
+    if version and l_nonce and l_blob and l_tag:
+        expect = hmac.new(SIGNATURE_SECRET, version + l_nonce + l_blob,
+                          hashlib.sha256).digest()
+        return hmac.compare_digest(expect, l_tag), None
+    return False, None
+
+
+def thinking_block(prefix_digest: Optional[bytes] = None) -> dict:
     """Блок скрытого рассуждения так, как его отдаёт оригинал.
 
     При display="omitted" (по умолчанию у большинства современных моделей) Anthropic
@@ -1147,12 +1270,14 @@ def thinking_block() -> dict:
     непрозрачна: её нельзя разбирать, только возвращать неизменной.
     """
     if THINKING_BLOCK_STYLE == "redacted":
-        return {"type": "redacted_thinking", "data": make_redacted_signature()}
+        return {"type": "redacted_thinking",
+                "data": make_redacted_signature(prefix_digest)}
     return {"type": "thinking", "thinking": "",
-            "signature": make_thinking_signature("")}
+            "signature": make_thinking_signature("", prefix_digest)}
 
 
-def thinking_stream_payloads(index: int) -> list:
+def thinking_stream_payloads(index: int,
+                             prefix_digest: Optional[bytes] = None) -> list:
     """Пары (имя события, тело) для блока скрытого рассуждения.
 
     Возвращаем именно тело, а не готовый SSE: сборкой кадра занимается `sse_ev`
@@ -1170,7 +1295,7 @@ def thinking_stream_payloads(index: int) -> list:
             ("content_block_delta", {
                 "type": "content_block_delta", "index": index,
                 "delta": {"type": "signature_delta",
-                          "signature": make_redacted_signature()}}),
+                          "signature": make_redacted_signature(prefix_digest)}}),
             ("content_block_stop", {"type": "content_block_stop", "index": index}),
         ]
     return [
@@ -1183,9 +1308,66 @@ def thinking_stream_payloads(index: int) -> list:
         ("content_block_delta", {
             "type": "content_block_delta", "index": index,
             "delta": {"type": "signature_delta",
-                      "signature": make_thinking_signature("")}}),
+                      "signature": make_thinking_signature("", prefix_digest)}}),
         ("content_block_stop", {"type": "content_block_stop", "index": index}),
     ]
+
+
+def _thinking_drop_allowed(body: dict, betas: str) -> bool:
+    th = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
+    bb = th.get("block_binding") if isinstance(th.get("block_binding"), dict) else {}
+    return (bb.get("prefix_mismatch_behavior") == "drop_block"
+            and _THINKING_BETA in (betas or ""))
+
+
+def check_thinking_blocks(body: dict, betas: str = "",
+                          chain: Optional[list] = None) -> Optional[str]:
+    """Проверка подписей thinking-блоков как у Claude.
+
+    Возвращает текст 400-ошибки или None. Блоки с несовпавшим префиксом
+    выкидываются из запроса, если клиент включил drop_block.
+    """
+    msgs = body.get("messages")
+    if not isinstance(msgs, list):
+        return None
+    if chain is None:
+        chain = thinking_prefix_chain(body.get("system"), body.get("tools"), msgs)
+    drop_ok = _thinking_drop_allowed(body, betas)
+    for i, msg in enumerate(msgs):
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        kept: list = []
+        for j, blk in enumerate(content):
+            if not isinstance(blk, dict):
+                kept.append(blk)
+                continue
+            btype = blk.get("type")
+            if btype not in ("thinking", "redacted_thinking"):
+                kept.append(blk)
+                continue
+            field = "signature" if btype == "thinking" else "data"
+            ok, prefix = verify_thinking_signature(blk.get(field))
+            if not ok:
+                return (f"messages.{i}.content.{j}: Invalid `{field}` in "
+                        f"`{btype}` block")
+            if prefix is not None and prefix != chain[i]:
+                if drop_ok:
+                    continue
+                text = (f"messages.{i}.content.{j}: Invalid `{field}` in "
+                        f"`{btype}` block. The block is bound to a different "
+                        f"conversation. Remove the block, or set "
+                        f"`thinking.block_binding.prefix_mismatch_behavior` "
+                        f"to \"drop_block\".")
+                if _THINKING_BETA not in (betas or ""):
+                    text += (f" That setting requires the `{_THINKING_BETA}` "
+                             f"value in the `anthropic-beta` header.")
+                return text
+            kept.append(blk)
+        msg["content"] = kept
+    return None
 
 
 def signature_valid(sig, expected_body: Optional[bytes] = None) -> bool:
@@ -1718,6 +1900,25 @@ _BRAND_SCRUB = [
 ]
 
 
+_THINK_KEYS = ("reasoning_content", "reasoning", "thinking", "thinking_content",
+               "thought", "reasoning_details", "encrypted_content", "redacted_thinking")
+
+
+def _strip_thinking_value(content):
+    """Убирает теги рассуждения из content (строка или список частей)."""
+    if isinstance(content, str):
+        return strip_thinking_full(content)[0]
+    if isinstance(content, list):
+        out = []
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                part = dict(part)
+                part["text"] = strip_thinking_full(part["text"])[0]
+            out.append(part)
+        return out
+    return content
+
+
 def sanitize_text(text: str) -> str:
     if not isinstance(text, str) or not text:
         return text or ""
@@ -1759,16 +1960,18 @@ def sanitize_openai_body(obj: dict, model: str,
                 nm["tool_calls"] = m["tool_calls"]
             if "function_call" in m:
                 nm["function_call"] = m["function_call"]
-            if "reasoning_content" in m:
-                nm["reasoning_content"] = m["reasoning_content"]
             if "refusal" in m:
                 nm["refusal"] = m["refusal"]
+            # Мышление наружу не отдаётся никогда — ни полем, ни текстом в content.
+            if "content" in nm:
+                nm["content"] = _strip_thinking_value(nm["content"])
+            for k in _THINK_KEYS:
+                nm.pop(k, None)
             nch["message"] = nm
         if "delta" in ch:
             d = ch.get("delta") or {}
             nd: dict[str, Any] = {}
-            for k in ("role", "content", "tool_calls", "function_call",
-                      "reasoning_content", "refusal"):
+            for k in ("role", "content", "tool_calls", "function_call", "refusal"):
                 if k in d:
                     nd[k] = d[k]
             nch["delta"] = nd
@@ -3309,19 +3512,6 @@ class CachedUpstream:
         yield self._sse()
 
 
-class _AnthropicRequestError(Exception):
-    def __init__(self, message: str, status_code: int = 400):
-        super().__init__(message)
-        self.message = message
-        self.status_code = status_code
-
-# ══════════════════════════════════════════════════════════════════════
-#  HTTPX CLIENT
-# ══════════════════════════════════════════════════════════════════════
-
-http_client: Optional[httpx.AsyncClient] = None
-
-
 async def reload_loop() -> None:
     """Перечитывать ключи и модели из базы.
 
@@ -3639,10 +3829,12 @@ async def openai_chat(req: Request):
         # strip thinking from content
         try:
             msg_obj = (data.get("choices") or [{}])[0].get("message") or {}
-            raw_content = msg_obj.get("content") or ""
+            raw_content = msg_obj.get("content")
             if raw_content:
-                clean_content, _ = strip_thinking_full(raw_content)
-                msg_obj["content"] = leak.feed(clean_content) + leak.flush()
+                clean_content = _strip_thinking_value(raw_content)
+                if isinstance(clean_content, str):
+                    clean_content = leak.feed(clean_content) + leak.flush()
+                msg_obj["content"] = clean_content
         except Exception:
             pass
 
@@ -3772,8 +3964,7 @@ async def openai_chat(req: Request):
                                 if (not d0.get("content")
                                         and not d0.get("role")
                                         and not d0.get("tool_calls")
-                                        and not c0.get("finish_reason")
-                                        and not d0.get("reasoning_content")):
+                                        and not c0.get("finish_reason")):
                                     continue
                         except Exception:
                             pass
@@ -4422,7 +4613,8 @@ async def anth_to_openai(req: dict) -> dict:
 
 def openai_to_anth(data: dict, in_tok: int, model: str,
                    thinking_requested: bool = False,
-                   cache_created: int = 0, cache_read: int = 0) -> dict:
+                   cache_created: int = 0, cache_read: int = 0,
+                   thinking_prefix: Optional[bytes] = None) -> dict:
     ch = (data.get("choices") or [{}])[0]
     msg = ch.get("message", {}) or {}
     raw_content = msg.get("content")
@@ -4442,7 +4634,7 @@ def openai_to_anth(data: dict, in_tok: int, model: str,
     # возвращает его с подписью даже при display=omitted и пустом тексте.
     # Без блока ответ считается таким, где thinking проигнорирован.
     if thinking_requested and EMIT_REDACTED_THINKING:
-        blocks.insert(0, thinking_block())
+        blocks.insert(0, thinking_block(thinking_prefix))
 
     for tc in (msg.get("tool_calls") or []):
         if not isinstance(tc, dict):
@@ -4575,42 +4767,17 @@ async def anth_messages(req: Request):
                        "No upstream key for this client key. Set it when generating the key.",
                        401, req_id, fake_model)
 
-    # verify incoming signatures
-    try:
-        for msg_idx, msg in enumerate(body.get("messages", []) or []):
-            if not isinstance(msg, dict):
-                continue
-            content = msg.get("content")
-            if not isinstance(content, list):
-                continue
-            for blk_idx, b in enumerate(content):
-                if not isinstance(b, dict):
-                    continue
-                bt = b.get("type")
-                if bt == "thinking":
-                    sig = b.get("signature", "")
-                    if not isinstance(sig, str) or not sig:
-                        raise _AnthropicRequestError(
-                            f"messages.{msg_idx}.content.{blk_idx}.thinking.signature: missing signature",
-                            400)
-                    thinking_text = b.get("thinking", "") or ""
-                    expected = hashlib.sha256(thinking_text.encode("utf-8", "ignore")).digest()
-                    if not signature_valid(sig, expected_body=expected):
-                        raise _AnthropicRequestError(
-                            f"messages.{msg_idx}.content.{blk_idx}.thinking.signature: "
-                            f"invalid or forged signature",
-                            400)
-                elif bt == "redacted_thinking":
-                    data_field = b.get("data", "")
-                    if not isinstance(data_field, str) or not signature_valid(data_field):
-                        raise _AnthropicRequestError(
-                            f"messages.{msg_idx}.content.{blk_idx}.redacted_thinking.data: "
-                            f"invalid or forged signature",
-                            400)
-    except _AnthropicRequestError as e:
-        return err_ant("invalid_request_error", e.message, e.status_code, req_id, fake_model)
-
+    # Подписи thinking-блоков проверяются как у Claude: целостность подписи и
+    # привязка к префиксу диалога. Непрошедшие блоки либо дают 400, либо
+    # выкидываются, если клиент включил drop_block.
     _anth_ver, _anth_betas = anth_request_meta(req)
+    _think_chain = thinking_prefix_chain(body.get("system"), body.get("tools"),
+                                         body.get("messages") or [])
+    _think_err = check_thinking_blocks(body, _anth_betas, _think_chain)
+    if _think_err:
+        return err_ant("invalid_request_error", _think_err, 400, req_id, fake_model)
+    # Подпись, которую получит клиент, привязана к префиксу этого запроса.
+    _think_prefix = _think_chain[-1]
     if _anth_ver and _anth_ver not in ("2023-06-01", "2023-01-01"):
         log.info("[ANTH] version=%r betas=%s", _anth_ver, _anth_betas)
     oai_req = await anth_to_openai(body)
@@ -4697,7 +4864,8 @@ async def anth_messages(req: Request):
         result = openai_to_anth(data, visible_in, fake_model,
                                 thinking_requested=thinking_requested,
                                 cache_created=_cache_created,
-                                cache_read=_cache_read)
+                                cache_read=_cache_read,
+                                thinking_prefix=_think_prefix)
         # scrub visible text
         try:
             for blk in result.get("content") or []:
@@ -4818,7 +4986,7 @@ async def anth_messages(req: Request):
         })
 
         if thinking_requested and EMIT_REDACTED_THINKING:
-            for _name, _obj in thinking_stream_payloads(0):
+            for _name, _obj in thinking_stream_payloads(0, _think_prefix):
                 yield sse_ev(_name, _obj)
             idx = 1
 
